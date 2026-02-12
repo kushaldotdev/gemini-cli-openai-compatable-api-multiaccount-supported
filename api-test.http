@@ -1,0 +1,259 @@
+### Test the /v1/models endpoint
+GET https://gemini-cli-worker.kushal.workers.dev/v1/models
+Content-Type: application/json
+
+###
+
+### Check KV cache status
+GET https://gemini-cli-worker.kushal.workers.dev/v1/debug/cache
+Content-Type: application/json
+
+###
+
+### Test token authentication only
+POST https://gemini-cli-worker.kushal.workers.dev/v1/token-test
+Content-Type: application/json
+
+###
+
+### Test authentication and basic functionality
+POST https://gemini-cli-worker.kushal.workers.dev/v1/test
+Content-Type: application/json
+
+###
+
+### Test chat completions with gemini-2.5-flash (simple message)
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! Can you tell me about yourself?"
+    }
+  ]
+}
+
+###
+
+### Test chat completions with system prompt
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-pro",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful coding assistant. Always provide clear and concise explanations."
+    },
+    {
+      "role": "user",
+      "content": "Explain what TypeScript is in simple terms."
+    }
+  ]
+}
+
+###
+
+### Test chat completions with conversation history
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.0-flash-001",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What is the capital of France?"
+    },
+    {
+      "role": "assistant",
+      "content": "The capital of France is Paris."
+    },
+    {
+      "role": "user",
+      "content": "What's the population of that city?"
+    }
+  ]
+}
+
+###
+
+### Test with gemini-2.0-flash-thinking model
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.0-flash-thinking-exp-01-21",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Solve this step by step: If a train travels 120 km in 1.5 hours, what is its average speed?"
+    }
+  ]
+}
+
+###
+
+### Test with experimental model
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-exp-1206",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a creative writing assistant."
+    },
+    {
+      "role": "user",
+      "content": "Write a short poem about coding in TypeScript."
+    }
+  ]
+}
+
+###
+
+### Test error handling - invalid model
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "invalid-model-name",
+  "messages": [
+    {
+      "role": "user",
+      "content": "This should fail with an invalid model."
+    }
+  ]
+}
+
+###
+
+### Test error handling - empty messages
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-flash",
+  "messages": []
+}
+
+###
+
+### Test chat completions with image support (Base64)
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What do you see in this image?"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAv/xAAhEAACAQMDBQAAAAAAAAAAAAABAgMABAUGIWGRkrHB0f/EABUBAQEAAAAAAAAAAAAAAAAAAAMF/8QAGhEAAgIDAAAAAAAAAAAAAAAAAAECEgMRkf/aAAwDAQACEQMRAD8AltJagyeH0AthI5xdrLcNM91BF5pX2HaH9bcfaSXWGaRmknyJckriTv2Lw4d1vUlLtWFq0x8gm3o8aJkJnGzJ5MmQmJWNwcKaGAa8kxoLpxTj5YGEZMo/M97v2Wma0xTKXJ81+fF7j2sJ2YWNZBIlJgLyG+5HRFFyC9VhQSp1A/aN6PmCMUoBOGmg9MvYDY7PKW9k+HfZuBuBsEjJm3fGc2vb8M7BQhQjUl4AHGtaP1k7oBkJF5r2OvG5VZnUdOJOcAOZYZ0uJjWVYwkU6SsZxH2rHVFmVhNnk6+eRVk0LKhUqVF3hRgEMGHTNP1Hf"
+          }
+        }
+      ]
+    }
+  ]
+}
+
+###
+
+### Test chat completions with image support (URL)
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-pro",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Describe this image in detail."
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
+            "detail": "high"
+          }
+        }
+      ]
+    }
+  ]
+}
+
+###
+
+### Test chat completions with multiple images
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-pro",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Compare these two images and tell me the differences."
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+          }
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    }
+  ]
+}
+
+###
+
+### Test error handling - trying to use images with non-vision model
+POST https://gemini-cli-worker.kushal.workers.dev/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "text-only-model-if-exists",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "What's in this image?"
+        },
+        {
+          "type": "image_url",
+          "image_url": {
+            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+          }
+        }
+      ]
+    }
+  ]
+}

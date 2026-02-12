@@ -1,0 +1,47 @@
+### Test non-streaming chat completion
+POST http://localhost:8787/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! How are you?"
+    }
+  ],
+  "stream": false
+}
+
+###
+
+### Test streaming chat completion (default behavior)
+POST http://localhost:8787/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! How are you?"
+    }
+  ],
+  "stream": true
+}
+
+###
+
+### Test streaming chat completion (without explicit stream parameter - should default to true)
+POST http://localhost:8787/v1/chat/completions
+Content-Type: application/json
+
+{
+  "model": "gemini-2.5-flash",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello! How are you?"
+    }
+  ]
+}
