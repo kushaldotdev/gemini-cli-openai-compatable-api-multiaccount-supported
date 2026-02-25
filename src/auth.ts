@@ -66,17 +66,24 @@ export class AuthManager {
 	}
 
 	/**
-	 * Extracts the email from the refresh token if it is a valid JWT.
+	 * Extracts the email from a JWT token.
+	 * Handles Base64URL encoding which is standard for JWTs.
 	 */
-	private getEmailFromToken(token: string): string {
+	private getEmailFromToken(token: string | undefined): string {
+		if (!token) return "unknown-account";
 		try {
 			const parts = token.split('.');
-			if (parts.length === 3) {
-				const payload = JSON.parse(atob(parts[1]));
-				if (payload.email) return payload.email;
+			if (parts.length >= 2) {
+				// Base64URL to Base64
+				let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+				// Add padding
+				while (base64.length % 4) base64 += '=';
+				
+				const payload = JSON.parse(atob(base64));
+				return payload.email || payload.unique_name || payload.sub || "unknown-account";
 			}
 		} catch (e) {
-			// Fallback if not a JWT or no email field
+			// Fallback if not a JWT or decoding fails
 		}
 		return "unknown-account";
 	}
@@ -133,14 +140,26 @@ export class AuthManager {
 				this.accounts.push(account);
 				this.accountIds.push(await this.getAccountId(account));
 				
-				// Try to get email, fallback to project_id, then to index
-				let id = this.getEmailFromToken(account.refresh_token);
+				// Priority for identification: 
+				// 1. Manual email field
+				// 2. id_token JWT
+				// 3. refresh_token JWT
+				// 4. project_id
+				let id = (account as any).email || "unknown-account";
+				
+				if (id === "unknown-account") {
+					id = this.getEmailFromToken(account.id_token);
+				}
+				if (id === "unknown-account") {
+					id = this.getEmailFromToken(account.refresh_token);
+				}
 				if (id === "unknown-account" && account.project_id) {
 					id = `project:${account.project_id}`;
 				}
 				if (id === "unknown-account") {
 					id = `account:${i}`;
 				}
+				
 				this.accountEmails.push(id);
 			}
 
@@ -470,7 +489,7 @@ export class AuthManager {
 				await this.env.GEMINI_CLI_KV.put(cacheKey, JSON.stringify(tokenData), {
 					expirationTtl: ttlSeconds
 				});
-				console.log(`Token cached in KV storage for account ${accountIndex} with TTL of ${ttlSeconds} seconds`);
+				console.log(`Token cached in KV storage for account ${accountIndex} (${accountId}) with TTL of ${ttlSeconds} seconds`);
 			} else {
 				console.log("Token expires too soon, not caching in KV");
 			}
