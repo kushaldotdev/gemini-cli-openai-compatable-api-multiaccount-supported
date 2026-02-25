@@ -586,7 +586,22 @@ export class GeminiApiClient {
 
 			const errorText = await response.text();
 			console.error(`[GeminiAPI] Stream request failed: ${response.status}`, errorText);
-			throw new Error(`Stream request failed: ${response.status}`);
+			
+			let errorMessage = `Stream request failed: ${response.status}`;
+			try {
+				const errorJson = JSON.parse(errorText);
+				if (errorJson.error && errorJson.error.message) {
+					errorMessage = `${errorJson.error.message}`;
+				}
+			} catch (e) {
+				// Fallback to raw text if not JSON
+				if (errorText.length > 0) {
+					errorMessage += ` - ${errorText.substring(0, 500)}`;
+				}
+			}
+			
+			yield { type: "text", data: `Error: ${errorMessage}` };
+			return;
 		}
 
 		if (!response.body) {
