@@ -115,7 +115,7 @@ OpenAIRoute.post("/chat/completions", async (c) => {
 		if (hasImages && !geminiCliModels[model].supportsImages) {
 			return c.json(
 				{
-					error: `Model '${model}' does not support image inputs. Please use a vision-capable model like gemini-2.5-pro or gemini-2.5-flash.`
+					error: `Model '${model}' does not support image inputs. Please use a vision-capable model like gemini-3.1-pro-preview or gemini-2.5-pro.`
 				},
 				400
 			);

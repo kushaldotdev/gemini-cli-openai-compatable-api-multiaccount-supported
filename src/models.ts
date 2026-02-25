@@ -55,7 +55,7 @@ export const geminiCliModels: Record<string, ModelInfo> = {
 };
 
 // --- Default Model ---
-export const DEFAULT_MODEL = "gemini-2.5-flash";
+export const DEFAULT_MODEL = "gemini-3.1-pro-preview";
 
 // --- Helper Functions ---
 export function getModelInfo(modelId: string): ModelInfo | null {

@@ -28,6 +28,7 @@ export const DEFAULT_TEMPERATURE = 0.7;
 
 // Auto model switching configuration
 export const AUTO_SWITCH_MODEL_MAP = {
+	"gemini-3.1-pro-preview": "gemini-3.1-flash-preview",
 	"gemini-2.5-pro": "gemini-2.5-flash"
 } as const;
 

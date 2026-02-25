@@ -15,11 +15,11 @@ Transform Google's Gemini models into OpenAI-compatible endpoints using Cloudfla
 
 | Model ID                       | Context | Max Tokens | Thinking |
 | ------------------------------ | ------- | ---------- | -------- |
-| `gemini-2.5-pro`               | 1M      | 65K        | ✅       |
-| `gemini-2.5-flash` _(default)_ | 1M      | 65K        | ✅       |
-| `gemini-2.5-flash-lite`        | 1M      | 65K        | ✅       |
-| `gemini-3.1-pro-preview`       | 1M      | 65K        | ✅       |
+| `gemini-3.1-pro-preview`       | 1M      | 65K        | ✅       | _(default)_
 | `gemini-3.1-flash-preview`     | 1M      | 65K        | ✅       |
+| `gemini-2.5-pro`               | 1M      | 65K        | ✅       |
+| `gemini-2.5-flash`             | 1M      | 65K        | ✅       |
+| `gemini-2.5-flash-lite`        | 1M      | 65K        | ✅       |
 
 ---
 
