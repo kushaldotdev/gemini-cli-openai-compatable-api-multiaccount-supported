@@ -54,8 +54,9 @@ export class AutoModelSwitchingHelper {
 	/**
 	 * Creates a notification message for when a model switch occurs.
 	 */
-	createSwitchNotification(originalModel: string, fallbackModel: string): string {
-		return `[Auto-switched from ${originalModel} to ${fallbackModel} due to rate limiting]\n\n`;
+	createSwitchNotification(originalModel: string, fallbackModel: string, email?: string): string {
+		const accountInfo = email ? ` on account ${email}` : "";
+		return `[Rate limit hit. Auto-switched from ${originalModel} to ${fallbackModel}${accountInfo}]\n\n`;
 	}
 
 	/**

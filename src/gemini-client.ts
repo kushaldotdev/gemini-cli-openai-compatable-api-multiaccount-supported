@@ -573,10 +573,14 @@ export class GeminiApiClient {
 						};
 
 						// Add a notification chunk about the model switch
-						// yield {
-						// 	type: "text",
-						// 	data: this.autoSwitchHelper.createSwitchNotification(originalModel, fallbackModel)
-						// };
+						yield {
+							type: "text",
+							data: this.autoSwitchHelper.createSwitchNotification(
+								originalModel,
+								fallbackModel,
+								this.authManager.getCurrentAccountEmail()
+							)
+						};
 
 						yield* this.performStreamRequest(
 							fallbackRequest,
@@ -609,8 +613,16 @@ export class GeminiApiClient {
 							project: newProjectId
 						};
 
-						console.log(`Retrying request with account ${this.authManager.getCurrentAccountIndex()} (retry ${accountRetryCount + 1})`);
+						const currentEmail = this.authManager.getCurrentAccountEmail();
+						const currentModel = (streamRequest as any).model || originalModel || "unknown-model";
 						
+						console.log(`Retrying request with account ${currentEmail} (retry ${accountRetryCount + 1})`);
+						
+						yield {
+							type: "text",
+							data: `[Rate limit hit. Rotating to account: ${currentEmail} | Model: ${currentModel}...]\n\n`
+						};
+
 						yield* this.performStreamRequest(
 							rotatedRequest,
 							needsThinkingClose,

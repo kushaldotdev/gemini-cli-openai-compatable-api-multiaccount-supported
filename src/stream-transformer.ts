@@ -177,7 +177,7 @@ export function createOpenAIStreamTransformer(model: string): TransformStream<St
 			}
 		},
 		flush(controller) {
-			const finishReason = toolCallId ? "tool_calls" : "stop";
+			const finishReason = toolCallId ? "tool_calls" : (firstChunk ? "content_filter" : "stop");
 			const finalChunk: OpenAIFinalChunk = {
 				id: chatID,
 				object: OPENAI_CHAT_COMPLETION_OBJECT,

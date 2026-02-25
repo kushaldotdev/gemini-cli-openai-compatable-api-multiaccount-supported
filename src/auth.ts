@@ -59,9 +59,26 @@ export class AuthManager {
 	private currentAccountIndex: number = 0;
 	private isMultiAccountMode: boolean = false;
 	private accountIds: string[] = []; // Stable IDs for each account
+	private accountEmails: string[] = []; // Extracted emails for each account
 
 	constructor(env: Env) {
 		this.env = env;
+	}
+
+	/**
+	 * Extracts the email from the refresh token if it is a valid JWT.
+	 */
+	private getEmailFromToken(token: string): string {
+		try {
+			const parts = token.split('.');
+			if (parts.length === 3) {
+				const payload = JSON.parse(atob(parts[1]));
+				if (payload.email) return payload.email;
+			}
+		} catch (e) {
+			// Fallback if not a JWT or no email field
+		}
+		return "unknown-account";
 	}
 
 	/**
@@ -107,6 +124,7 @@ export class AuthManager {
 			// Validate and generate IDs
 			this.accounts = [];
 			this.accountIds = [];
+			this.accountEmails = [];
 			for (let i = 0; i < rawAccounts.length; i++) {
 				const account = rawAccounts[i];
 				if (!account.refresh_token || !account.access_token) {
@@ -114,6 +132,16 @@ export class AuthManager {
 				}
 				this.accounts.push(account);
 				this.accountIds.push(await this.getAccountId(account));
+				
+				// Try to get email, fallback to project_id, then to index
+				let id = this.getEmailFromToken(account.refresh_token);
+				if (id === "unknown-account" && account.project_id) {
+					id = `project:${account.project_id}`;
+				}
+				if (id === "unknown-account") {
+					id = `account:${i}`;
+				}
+				this.accountEmails.push(id);
 			}
 
 			this.isMultiAccountMode = this.isMultiAccountEnabled() && this.accounts.length > 1;
@@ -574,10 +602,17 @@ export class AuthManager {
 	}
 
 	/**
-	 * Get current account index (useful for debugging).
+	 * Get the current account index (useful for debugging).
 	 */
 	public getCurrentAccountIndex(): number {
 		return this.currentAccountIndex;
+	}
+
+	/**
+	 * Get the email for the current account.
+	 */
+	public getCurrentAccountEmail(): string {
+		return this.accountEmails[this.currentAccountIndex] || "unknown-account";
 	}
 
 	/**
