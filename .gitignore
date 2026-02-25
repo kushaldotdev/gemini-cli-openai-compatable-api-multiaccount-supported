@@ -136,3 +136,4 @@ dist
 .pnp.*
 .dev.vars
 .wrangler/
+gcp_service_account.json

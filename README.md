@@ -18,8 +18,8 @@ Transform Google's Gemini models into OpenAI-compatible endpoints using Cloudfla
 | `gemini-2.5-pro`               | 1M      | 65K        | ✅       |
 | `gemini-2.5-flash` _(default)_ | 1M      | 65K        | ✅       |
 | `gemini-2.5-flash-lite`        | 1M      | 65K        | ✅       |
-| `gemini-3-pro-preview`         | 1M      | 65K        | ✅       |
-| `gemini-3-flash-preview`       | 1M      | 65K        | ✅       |
+| `gemini-3.1-pro-preview`       | 1M      | 65K        | ✅       |
+| `gemini-3.1-flash-preview`     | 1M      | 65K        | ✅       |
 
 ---
 
@@ -67,6 +67,8 @@ npm install
 ### Step 4: Configure Environment
 
 Create a `.dev.vars` file in the project root.
+
+> **Pro Tip:** You can also create a file named `gcp_service_account.json` in the root directory and paste your JSON credentials there for better readability. The `configure-secrets.js` script will automatically pick it up. See `gcp_service_account.example.json` for the expected format.
 
 #### Single Account Setup
 

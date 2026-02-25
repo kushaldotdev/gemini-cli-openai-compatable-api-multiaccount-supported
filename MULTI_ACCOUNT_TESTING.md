@@ -37,15 +37,27 @@ cat combined.json | jq -c '.' > credentials.json
 
 ### 3. Configure Environment Variables
 
-In your `.dev.vars` file:
+You have two options for configuring credentials:
 
+#### Option A: Using gcp_service_account.json (Recommended for Readability)
+1. Create a file named `gcp_service_account.json` in the root directory.
+2. Paste the JSON array from `combined.json` into this file. You can keep it formatted with newlines for readability.
+3. In your `.dev.vars` file, you only need:
+   ```bash
+   # Enable multi-account rotation
+   ENABLE_MULTI_ACCOUNT=true
+   # Optional: Your API key
+   OPENAI_API_KEY=sk-your-test-key
+   ```
+4. Run `node configure-secrets.js` to upload the credentials to Cloudflare.
+
+#### Option B: Using .dev.vars (Standard)
+In your `.dev.vars` file:
 ```bash
 # Multi-account credentials
 GCP_SERVICE_ACCOUNT=<paste content from credentials.json>
-
 # Enable multi-account rotation
 ENABLE_MULTI_ACCOUNT=true
-
 # Optional: Your API key
 OPENAI_API_KEY=sk-your-test-key
 ```
