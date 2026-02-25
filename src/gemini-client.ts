@@ -11,7 +11,7 @@ import {
 } from "./types";
 import { AuthManager } from "./auth";
 import { CODE_ASSIST_ENDPOINT, CODE_ASSIST_API_VERSION } from "./config";
-import { REASONING_MESSAGES, REASONING_CHUNK_DELAY, THINKING_CONTENT_CHUNK_SIZE } from "./constants";
+import { REASONING_MESSAGES, REASONING_CHUNK_DELAY, THINKING_CONTENT_CHUNK_SIZE, MULTI_ACCOUNT_CONFIG } from "./constants";
 import { geminiCliModels } from "./models";
 import { validateImageUrl } from "./utils/image-utils";
 import { GenerationConfigValidator } from "./helpers/generation-config-validator";
@@ -105,6 +105,8 @@ export class GeminiApiClient {
 	 */
 	public async discoverProjectId(): Promise<string> {
 		// 1. Try account-specific project ID from AuthManager
+		// This should ALWAYS be checked first and not cached locally in GeminiApiClient
+		// because the account might rotate.
 		const accountProjectId = this.authManager.getCurrentProjectId();
 		if (accountProjectId) {
 			return accountProjectId;
@@ -115,8 +117,8 @@ export class GeminiApiClient {
 			return this.env.GEMINI_PROJECT_ID;
 		}
 
-		// 3. Try cached project ID
-		if (this.projectId) {
+		// 3. Try cached project ID (only if not in multi-account mode or first time)
+		if (this.projectId && !this.authManager.isMultiAccount()) {
 			return this.projectId;
 		}
 
@@ -524,7 +526,8 @@ export class GeminiApiClient {
 		isRetry: boolean = false,
 		realThinkingAsContent: boolean = false,
 		originalModel?: string,
-		nativeToolsManager?: NativeToolsManager
+		nativeToolsManager?: NativeToolsManager,
+		accountRetryCount: number = 0
 	): AsyncGenerator<StreamChunk> {
 		const citationsProcessor = new CitationsProcessor(this.env);
 		const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:streamGenerateContent?alt=sse`, {
@@ -547,43 +550,84 @@ export class GeminiApiClient {
 					true,
 					realThinkingAsContent,
 					originalModel,
-					nativeToolsManager
+					nativeToolsManager,
+					accountRetryCount
 				); // Retry once
 				return;
 			}
 
-			// Handle rate limiting with auto model switching
-			if (this.autoSwitchHelper.isRateLimitStatus(response.status) && !isRetry && originalModel) {
-				const fallbackModel = this.autoSwitchHelper.getFallbackModel(originalModel);
-				if (fallbackModel && this.autoSwitchHelper.isEnabled()) {
-					console.log(
-						`Got ${response.status} error for model ${originalModel}, switching to fallback model: ${fallbackModel}`
-					);
+			// Handle rate limiting (429 or 503)
+			if (this.autoSwitchHelper.isRateLimitStatus(response.status)) {
+				// 1. Try model switching first if applicable
+				if (!isRetry && originalModel) {
+					const fallbackModel = this.autoSwitchHelper.getFallbackModel(originalModel);
+					if (fallbackModel && this.autoSwitchHelper.isEnabled()) {
+						console.log(
+							`Got ${response.status} error for model ${originalModel}, switching to fallback model: ${fallbackModel}`
+						);
 
-					// Create new request with fallback model
-					const fallbackRequest = {
-						...(streamRequest as Record<string, unknown>),
-						model: fallbackModel
-					};
+						// Create new request with fallback model
+						const fallbackRequest = {
+							...(streamRequest as Record<string, unknown>),
+							model: fallbackModel
+						};
 
-					// Add a notification chunk about the model switch
-					yield {
-						type: "text",
-						data: this.autoSwitchHelper.createSwitchNotification(originalModel, fallbackModel)
-					};
+						// Add a notification chunk about the model switch
+						// yield {
+						// 	type: "text",
+						// 	data: this.autoSwitchHelper.createSwitchNotification(originalModel, fallbackModel)
+						// };
 
-					yield* this.performStreamRequest(
-						fallbackRequest,
-						needsThinkingClose,
-						true,
-						realThinkingAsContent,
-						originalModel,
-						nativeToolsManager
-					);
-					return;
+						yield* this.performStreamRequest(
+							fallbackRequest,
+							needsThinkingClose,
+							true,
+							realThinkingAsContent,
+							originalModel,
+							nativeToolsManager,
+							accountRetryCount
+						);
+						return;
+					}
+				}
+
+				// 2. Try account rotation if multi-account is enabled
+				if (this.authManager.isMultiAccount() && accountRetryCount < MULTI_ACCOUNT_CONFIG.MAX_ACCOUNT_RETRY_ATTEMPTS) {
+					console.log(`Got rate limit error (${response.status}) for account ${this.authManager.getCurrentAccountIndex()}. Rotating accounts...`);
+					
+					// Mark current account as rate-limited
+					await this.authManager.markAccountRateLimited(this.authManager.getCurrentAccountIndex());
+					
+					try {
+						// This will find and initialize the next available account
+						await this.authManager.initializeAuth();
+						
+						// Update the request with the new project ID if it changed
+						const newProjectId = await this.discoverProjectId();
+						const rotatedRequest = {
+							...(streamRequest as Record<string, unknown>),
+							project: newProjectId
+						};
+
+						console.log(`Retrying request with account ${this.authManager.getCurrentAccountIndex()} (retry ${accountRetryCount + 1})`);
+						
+						yield* this.performStreamRequest(
+							rotatedRequest,
+							needsThinkingClose,
+							false, // Reset isRetry for the new account's first attempt
+							realThinkingAsContent,
+							originalModel,
+							nativeToolsManager,
+							accountRetryCount + 1
+						);
+						return;
+					} catch (rotationError) {
+						console.error("Account rotation failed during stream retry:", rotationError);
+					}
 				}
 			}
 
+			// If we reach here, it means no fallback or rotation was possible or they all failed
 			const errorText = await response.text();
 			console.error(`[GeminiAPI] Stream request failed: ${response.status}`, errorText);
 			
@@ -600,6 +644,7 @@ export class GeminiApiClient {
 				}
 			}
 			
+			// ONLY yield the error chunk if we are not going to retry
 			yield { type: "text", data: `Error: ${errorMessage}` };
 			return;
 		}

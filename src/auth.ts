@@ -58,9 +58,20 @@ export class AuthManager {
 	private accounts: OAuth2Credentials[] = [];
 	private currentAccountIndex: number = 0;
 	private isMultiAccountMode: boolean = false;
+	private accountIds: string[] = []; // Stable IDs for each account
 
 	constructor(env: Env) {
 		this.env = env;
+	}
+
+	/**
+	 * Generates a stable unique ID for an account based on its refresh token.
+	 */
+	private async getAccountId(account: OAuth2Credentials): Promise<string> {
+		const msgUint8 = new TextEncoder().encode(account.refresh_token);
+		const hashBuffer = await crypto.subtle.digest("SHA-256", msgUint8);
+		const hashArray = Array.from(new Uint8Array(hashBuffer));
+		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("").substring(0, 16);
 	}
 
 	/**
@@ -74,52 +85,44 @@ export class AuthManager {
 	 * Parses and loads accounts from environment variable.
 	 * Supports both single account (object) and multiple accounts (array).
 	 */
-	private loadAccounts(): void {
+	private async loadAccounts(): Promise<void> {
 		if (!this.env.GCP_SERVICE_ACCOUNT) {
 			throw new Error("`GCP_SERVICE_ACCOUNT` environment variable not set. Please provide OAuth2 credentials JSON.");
 		}
 
 		try {
 			const parsed = JSON.parse(this.env.GCP_SERVICE_ACCOUNT);
+			let rawAccounts: OAuth2Credentials[] = [];
 
 			// Check if it's an array (multi-account) or single object
 			if (Array.isArray(parsed)) {
-				// Validate that all array elements are valid OAuth2 credentials
 				if (parsed.length === 0) {
-					throw new Error("GCP_SERVICE_ACCOUNT array is empty. Please provide at least one account.");
+					throw new Error("GCP_SERVICE_ACCOUNT array is empty.");
 				}
-
-				for (let i = 0; i < parsed.length; i++) {
-					const account = parsed[i];
-					if (!account.refresh_token || !account.access_token) {
-						throw new Error(
-							`Invalid credentials at index ${i}: missing required fields (refresh_token or access_token)`
-						);
-					}
-				}
-
-				this.accounts = parsed as OAuth2Credentials[];
-				this.isMultiAccountMode = this.isMultiAccountEnabled() && this.accounts.length > 1;
-				console.log(`Loaded ${this.accounts.length} accounts. Multi-account mode: ${this.isMultiAccountMode}`);
+				rawAccounts = parsed as OAuth2Credentials[];
 			} else {
-				// Validate single account has required fields
-				if (!parsed.refresh_token || !parsed.access_token) {
-					throw new Error("Invalid credentials: missing required fields (refresh_token or access_token)");
+				rawAccounts = [parsed as OAuth2Credentials];
+			}
+
+			// Validate and generate IDs
+			this.accounts = [];
+			this.accountIds = [];
+			for (let i = 0; i < rawAccounts.length; i++) {
+				const account = rawAccounts[i];
+				if (!account.refresh_token || !account.access_token) {
+					throw new Error(`Invalid credentials at index ${i}: missing required fields`);
 				}
-
-				this.accounts = [parsed as OAuth2Credentials];
-				this.isMultiAccountMode = false;
-				console.log("Loaded single account");
+				this.accounts.push(account);
+				this.accountIds.push(await this.getAccountId(account));
 			}
 
-			if (this.accounts.length === 0) {
-				throw new Error("No valid accounts found in GCP_SERVICE_ACCOUNT");
-			}
+			this.isMultiAccountMode = this.isMultiAccountEnabled() && this.accounts.length > 1;
+			console.log(`Loaded ${this.accounts.length} accounts. Multi-account mode: ${this.isMultiAccountMode}`);
 		} catch (e: unknown) {
 			if (e instanceof SyntaxError) {
 				throw new Error(`Failed to parse GCP_SERVICE_ACCOUNT: Invalid JSON format. ${e.message}`);
 			}
-			throw e; // Re-throw if it's already our custom error
+			throw e;
 		}
 	}
 
@@ -130,7 +133,12 @@ export class AuthManager {
 		try {
 			const state = await this.env.GEMINI_CLI_KV.get(KV_ACCOUNT_ROTATION_KEY, "json");
 			if (state) {
-				return state as AccountRotationState;
+				const parsedState = state as AccountRotationState;
+				// Validate that the index is still within bounds of current accounts
+				if (parsedState.current_index >= this.accounts.length) {
+					parsedState.current_index = 0;
+				}
+				return parsedState;
 			}
 		} catch (error) {
 			console.log("No rotation state found or error:", error);
@@ -160,12 +168,13 @@ export class AuthManager {
 	 */
 	private async getAccountHealth(accountIndex: number): Promise<AccountHealthStatus> {
 		try {
-			const health = await this.env.GEMINI_CLI_KV.get(`${KV_ACCOUNT_HEALTH_PREFIX}${accountIndex}`, "json");
+			const accountId = this.accountIds[accountIndex];
+			const health = await this.env.GEMINI_CLI_KV.get(`${KV_ACCOUNT_HEALTH_PREFIX}${accountId}`, "json");
 			if (health) {
 				return health as AccountHealthStatus;
 			}
 		} catch (error) {
-			console.log(`No health data for account ${accountIndex}:`, error);
+			console.log(`No health data for account at index ${accountIndex}:`, error);
 		}
 
 		return {
@@ -178,19 +187,20 @@ export class AuthManager {
 	 */
 	private async updateAccountHealth(accountIndex: number, health: AccountHealthStatus): Promise<void> {
 		try {
+			const accountId = this.accountIds[accountIndex];
 			// Store with TTL for auto-expiry of rate limit status
-			await this.env.GEMINI_CLI_KV.put(`${KV_ACCOUNT_HEALTH_PREFIX}${accountIndex}`, JSON.stringify(health), {
+			await this.env.GEMINI_CLI_KV.put(`${KV_ACCOUNT_HEALTH_PREFIX}${accountId}`, JSON.stringify(health), {
 				expirationTtl: Math.floor(MULTI_ACCOUNT_CONFIG.RATE_LIMIT_COOLDOWN_MS / 1000) + 60 // Add buffer
 			});
 		} catch (error) {
-			console.error(`Failed to update health for account ${accountIndex}:`, error);
+			console.error(`Failed to update health for account at index ${accountIndex}:`, error);
 		}
 	}
 
 	/**
 	 * Marks an account as rate-limited.
 	 */
-	private async markAccountRateLimited(accountIndex: number): Promise<void> {
+	public async markAccountRateLimited(accountIndex: number): Promise<void> {
 		console.log(`Marking account ${accountIndex} as rate-limited`);
 		await this.updateAccountHealth(accountIndex, {
 			is_rate_limited: true,
@@ -294,7 +304,7 @@ export class AuthManager {
 	public async initializeAuth(): Promise<void> {
 		// Load accounts on first call
 		if (this.accounts.length === 0) {
-			this.loadAccounts();
+			await this.loadAccounts();
 		}
 
 		// In multi-account mode, find an available account
@@ -303,8 +313,9 @@ export class AuthManager {
 		}
 
 		try {
-			// Get cache key for current account
-			const cacheKey = this.isMultiAccountMode ? `${KV_TOKEN_KEY}_account_${this.currentAccountIndex}` : KV_TOKEN_KEY;
+			// Get cache key for current account using stable account ID
+			const accountId = this.accountIds[this.currentAccountIndex];
+			const cacheKey = `${KV_TOKEN_KEY}_${accountId}`;
 
 			// First, try to get a cached token from KV storage
 			let cachedTokenData: CachedTokenData | null = null;
@@ -313,7 +324,7 @@ export class AuthManager {
 				const cachedToken = await this.env.GEMINI_CLI_KV.get(cacheKey, "json");
 				if (cachedToken) {
 					cachedTokenData = cachedToken as CachedTokenData;
-					console.log(`Found cached token for account ${this.currentAccountIndex}`);
+					console.log(`Found cached token for account ${this.currentAccountIndex} (${accountId})`);
 				}
 			} catch (kvError) {
 				console.log("No cached token found in KV storage or KV error:", kvError);
@@ -414,7 +425,8 @@ export class AuthManager {
 	 */
 	private async cacheTokenInKV(accessToken: string, expiryDate: number, accountIndex: number): Promise<void> {
 		try {
-			const cacheKey = this.isMultiAccountMode ? `${KV_TOKEN_KEY}_account_${accountIndex}` : KV_TOKEN_KEY;
+			const accountId = this.accountIds[accountIndex];
+			const cacheKey = `${KV_TOKEN_KEY}_${accountId}`;
 
 			const tokenData: CachedTokenData = {
 				access_token: accessToken,
@@ -446,17 +458,12 @@ export class AuthManager {
 	 */
 	public async clearTokenCache(): Promise<void> {
 		try {
-			if (this.isMultiAccountMode) {
-				// Clear all account tokens
-				for (let i = 0; i < this.accounts.length; i++) {
-					const cacheKey = `${KV_TOKEN_KEY}_account_${i}`;
-					await this.env.GEMINI_CLI_KV.delete(cacheKey);
-				}
-				console.log(`Cleared cached tokens for all ${this.accounts.length} accounts from KV storage`);
-			} else {
-				await this.env.GEMINI_CLI_KV.delete(KV_TOKEN_KEY);
-				console.log("Cleared cached token from KV storage");
+			// Clear tokens for all currently loaded accounts
+			for (const accountId of this.accountIds) {
+				const cacheKey = `${KV_TOKEN_KEY}_${accountId}`;
+				await this.env.GEMINI_CLI_KV.delete(cacheKey);
 			}
+			console.log(`Cleared cached tokens for all ${this.accountIds.length} accounts from KV storage`);
 		} catch (kvError) {
 			console.log("Error clearing KV cache:", kvError);
 		}
@@ -467,7 +474,11 @@ export class AuthManager {
 	 */
 	public async getCachedTokenInfo(): Promise<TokenCacheInfo> {
 		try {
-			const cachedToken = await this.env.GEMINI_CLI_KV.get(KV_TOKEN_KEY, "json");
+			// In multi-account mode, we look for the current account's token
+			const accountId = this.accountIds[this.currentAccountIndex];
+			const cacheKey = accountId ? `${KV_TOKEN_KEY}_${accountId}` : KV_TOKEN_KEY;
+			
+			const cachedToken = await this.env.GEMINI_CLI_KV.get(cacheKey, "json");
 			if (cachedToken) {
 				const tokenData = cachedToken as CachedTokenData;
 				const timeUntilExpiry = tokenData.expiry_date - Date.now();
