@@ -7,6 +7,9 @@ import { GroundingMetadata, CitationSource } from "../types/native-tools";
  */
 export class CitationsProcessor {
 	private enableInlineCitations: boolean;
+	private uriMap: Map<string, number> = new Map();
+	private nextCitationNumber: number = 1;
+	private globalCharOffset: number = 0;
 
 	constructor(env: Env) {
 		this.enableInlineCitations = env.ENABLE_INLINE_CITATIONS === "true";
@@ -72,7 +75,11 @@ export class CitationsProcessor {
 					.map((i) => {
 						const uri = metadata.groundingChunks[i]?.web?.uri;
 						if (uri) {
-							return `[${i + 1}](${uri})`;
+							// Global deduplication and stable numbering
+							if (!this.uriMap.has(uri)) {
+								this.uriMap.set(uri, this.nextCitationNumber++);
+							}
+							return `[${this.uriMap.get(uri)}](${uri})`;
 						}
 						return null;
 					})
@@ -80,18 +87,25 @@ export class CitationsProcessor {
 
 				if (citationLinks.length > 0) {
 					const citationString = citationLinks.join(", ");
-					// Calculate the insertion index relative to the current `citedTextChunk`
-					const insertionIndex = originalEndIndex + offset;
-					const safeInsertionIndex = this.findSafeInsertionPoint(citedTextChunk, insertionIndex);
+					// Convert original index into local chunk index relative to previously emitted text length
+					const localInsertionBaseIndex = originalEndIndex - this.globalCharOffset;
 
-					// Insert the citation into the citedTextChunk
-					citedTextChunk =
-						citedTextChunk.slice(0, safeInsertionIndex) + citationString + citedTextChunk.slice(safeInsertionIndex);
+					// Make sure we are within bounds of the current chunk
+					if (localInsertionBaseIndex >= 0 && localInsertionBaseIndex <= citedTextChunk.length) {
+						const insertionIndex = localInsertionBaseIndex + offset;
+						const safeInsertionIndex = this.findSafeInsertionPoint(citedTextChunk, insertionIndex);
 
-					offset += citationString.length; // Update offset for subsequent insertions
+						// Insert the citation into the citedTextChunk
+						citedTextChunk =
+							citedTextChunk.slice(0, safeInsertionIndex) + citationString + citedTextChunk.slice(safeInsertionIndex);
+
+						offset += citationString.length; // Update offset for subsequent insertions in this chunk
+					}
 				}
 			}
 		}
+
+		this.globalCharOffset += textChunk.length; // track total unmodified text length
 		return citedTextChunk;
 	}
 

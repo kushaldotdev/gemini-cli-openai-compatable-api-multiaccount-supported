@@ -10,10 +10,13 @@ import { Env } from "../types";
  * - Masks sensitive data in request bodies
  */
 export const loggingMiddleware = async (c: Context<{ Bindings: Env }>, next: Next) => {
+	const requestId = crypto.randomUUID().slice(0, 8);
 	const method = c.req.method;
 	const path = c.req.path;
 	const startTime = Date.now();
-	const timestamp = new Date().toISOString();
+
+	// Attach requestId to response header so it's traceable
+	c.header("X-Request-ID", requestId);
 
 	// Log request body for POST/PUT/PATCH requests
 	let bodyLog = "";
@@ -23,23 +26,22 @@ export const loggingMiddleware = async (c: Context<{ Bindings: Env }>, next: Nex
 			const clonedReq = c.req.raw.clone();
 			const body = await clonedReq.text();
 
-			// Truncate very long bodies and mask sensitive data
-			const truncatedBody = body.length > 500 ? body.substring(0, 500) + "..." : body;
-			// Mask potential API keys or tokens
-			const maskedBody = truncatedBody.replace(/"(api_?key|token|authorization)":\s*"[^"]*"/gi, '"$1": "***"');
-			bodyLog = ` - Body: ${maskedBody}`;
+			// Log metadata only, never message content
+			try {
+				const parsed = JSON.parse(body);
+				bodyLog = ` model=${parsed.model ?? "?"} msgs=${parsed.messages?.length ?? "?"} stream=${parsed.stream ?? "?"}`;
+			} catch {
+				bodyLog = " [non-JSON body]";
+			}
 		} catch {
-			bodyLog = " - Body: [unable to parse]";
+			bodyLog = " [unreadable body]";
 		}
 	}
 
-	console.log(`[${timestamp}] ${method} ${path}${bodyLog} - Request started`);
+	console.log(`[${requestId}] ${method} ${path}${bodyLog}`);
 
 	await next();
 
 	const duration = Date.now() - startTime;
-	const status = c.res.status;
-	const endTimestamp = new Date().toISOString();
-
-	console.log(`[${endTimestamp}] ${method} ${path} - Completed with status ${status} (${duration}ms)`);
+	console.log(`[${requestId}] ${method} ${path} → ${c.res.status} (${duration}ms)`);
 };

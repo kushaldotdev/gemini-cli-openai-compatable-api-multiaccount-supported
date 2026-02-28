@@ -115,12 +115,54 @@ export class GenerationConfigValidator {
 	}
 
 	/**
+	 * Recursively sanitizes a JSON schema for Gemini API compatibility.
+	 * Strips OpenAI-specific fields (strict, additionalProperties, $-keys) and
+	 * normalises union array types (e.g. ["string","null"]) to a single string type.
+	 */
+	static sanitizeSchemaForGemini(schema: Record<string, unknown>): Record<string, unknown> {
+		const sanitized: Record<string, unknown> = {};
+
+		for (const [key, value] of Object.entries(schema)) {
+			// Drop OpenAI-only and JSON-schema meta keys that Gemini rejects
+			if (key === "strict" || key === "additionalProperties" || key.startsWith("$")) {
+				continue;
+			}
+
+			// Normalise ["string", "null"] union → "string" (pick first non-null entry)
+			if (key === "type" && Array.isArray(value)) {
+				const nonNull = (value as string[]).find((t) => t !== "null");
+				sanitized[key] = nonNull ?? "string";
+				continue;
+			}
+
+			// Recurse into nested objects
+			if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+				sanitized[key] = this.sanitizeSchemaForGemini(value as Record<string, unknown>);
+				continue;
+			}
+
+			// Recurse into arrays of objects (e.g. items, anyOf, oneOf)
+			if (Array.isArray(value)) {
+				sanitized[key] = value.map((item) =>
+					item !== null && typeof item === "object"
+						? this.sanitizeSchemaForGemini(item as Record<string, unknown>)
+						: item
+				);
+				continue;
+			}
+
+			sanitized[key] = value;
+		}
+
+		return sanitized;
+	}
+
+	/**
 	 * Creates a validated generation config for a specific model.
 	 * @param modelId - The Gemini model ID
 	 * @param options - Generation options including thinking budget and OpenAI parameters
 	 * @param isRealThinkingEnabled - Whether real thinking is enabled
 	 * @param includeReasoning - Whether to include reasoning in response
-	 * @param env - Environment variables for safety settings
 	 * @returns Validated generation configuration
 	 */
 	static createValidatedConfig(
@@ -173,10 +215,9 @@ export class GenerationConfigValidator {
 				};
 				console.log(`[GenerationConfig] Real thinking enabled for '${modelId}' with budget: ${validatedBudget}`);
 			} else {
-				// For thinking models, always use validated budget (can't use 0)
-				// Control thinking visibility with includeThoughts instead
+				// No real thinking requested — use dynamic or provided budget but suppress output
 				generationConfig.thinkingConfig = {
-					thinkingBudget: this.validateThinkingBudget(modelId, DEFAULT_THINKING_BUDGET),
+					thinkingBudget: validatedBudget,
 					includeThoughts: false // Disable thinking visibility in response
 				};
 			}
@@ -193,20 +234,12 @@ export class GenerationConfigValidator {
 		// Add tools configuration if provided
 		if (Array.isArray(options.tools) && options.tools.length > 0) {
 			const functionDeclarations = options.tools.map((tool) => {
-				let parameters = tool.function.parameters;
-				// Filter parameters for Claude-style compatibility by removing keys starting with '$'
-				if (parameters) {
-					const before = parameters;
-					parameters = Object.keys(parameters)
-						.filter((key) => !key.startsWith("$"))
-						.reduce(
-							(after, key) => {
-								after[key] = before[key];
-								return after;
-							},
-							{} as Record<string, unknown>
-						);
-				}
+				// Sanitize the parameter schema to remove OpenAI-specific fields that Gemini rejects
+				// (strict, additionalProperties, $-keys) and normalise union array types.
+				const parameters = tool.function.parameters
+					? this.sanitizeSchemaForGemini(tool.function.parameters as Record<string, unknown>)
+					: undefined;
+
 				return {
 					name: tool.function.name,
 					description: tool.function.description,
@@ -234,19 +267,40 @@ export class GenerationConfigValidator {
 
 		return { tools, toolConfig };
 	}
+
 	static createFinalToolConfiguration(
 		config: NativeToolsConfiguration,
-		options: Partial<ChatCompletionRequest> = {}
+		options: Partial<ChatCompletionRequest> = {},
+		env?: import("../types").Env
 	): {
 		tools: unknown[] | undefined;
 		toolConfig: unknown | undefined;
 	} {
+		if (env?.FORCE_OPENAI_TOOL_FORMAT === "true") {
+			// In forced OpenAI format mode, always use functionCallingConfig NONE
+			// unless the client explicitly provides tools
+			if (!options.tools || options.tools.length === 0) {
+				return { tools: undefined, toolConfig: { functionCallingConfig: { mode: "NONE" } } };
+			}
+			// Client provided tools — use them with tool_choice honoured
+			const { tools, toolConfig } = this.createValidateTools(options);
+			return { tools, toolConfig };
+		}
 		if (config.useCustomTools && config.customTools && config.customTools.length > 0) {
 			const { toolConfig } = this.createValidateTools(options);
 			return {
 				tools: [
 					{
-						functionDeclarations: config.customTools.map((t) => t.function)
+						// Apply schema sanitizer to customTools path (previously bypassed the sanitizer).
+						// This fixes the "Unknown name strict" / "type field is not repeating" Gemini errors
+						// when Kilo Code sends OpenAI-format tool schemas with strict:true or array types.
+						functionDeclarations: config.customTools.map((t) => ({
+							name: t.function.name,
+							description: t.function.description,
+							parameters: t.function.parameters
+								? this.sanitizeSchemaForGemini(t.function.parameters as Record<string, unknown>)
+								: undefined
+						}))
 					}
 				],
 				toolConfig: toolConfig
@@ -254,6 +308,10 @@ export class GenerationConfigValidator {
 		}
 
 		if (config.useNativeTools && config.nativeTools && config.nativeTools.length > 0) {
+			let nativeToolConfig: unknown = undefined;
+			if (options.tool_choice === "none") {
+				nativeToolConfig = { functionCallingConfig: { mode: "NONE" } };
+			}
 			return {
 				tools: config.nativeTools.map((tool) => {
 					if (tool.google_search) {
@@ -264,7 +322,7 @@ export class GenerationConfigValidator {
 					}
 					return tool;
 				}),
-				toolConfig: undefined // Native tools don't use toolConfig in the same way
+				toolConfig: nativeToolConfig // Native tools don't use toolConfig in the same way
 			};
 		}
 

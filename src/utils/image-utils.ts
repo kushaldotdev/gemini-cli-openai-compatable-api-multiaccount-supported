@@ -54,6 +54,16 @@ export function validateImageUrl(imageUrl: string): ImageValidationResult {
 			return { isValid: false, error: "Invalid base64 encoding" };
 		}
 
+		// Add size check before returning { isValid: true }:
+		const MAX_BASE64_IMAGE_BYTES = 20 * 1024 * 1024; // 20 MB
+		const estimatedBytes = (base64Part.length * 3) / 4;
+		if (estimatedBytes > MAX_BASE64_IMAGE_BYTES) {
+			return {
+				isValid: false,
+				error: `Image too large (~${Math.round(estimatedBytes / 1024 / 1024)}MB). Maximum base64 image size is 20MB.`
+			};
+		}
+
 		return { isValid: true, mimeType, format };
 	}
 

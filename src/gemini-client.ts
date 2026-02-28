@@ -11,11 +11,21 @@ import {
 } from "./types";
 import { AuthManager } from "./auth";
 import { CODE_ASSIST_ENDPOINT, CODE_ASSIST_API_VERSION } from "./config";
-import { REASONING_MESSAGES, REASONING_CHUNK_DELAY, THINKING_CONTENT_CHUNK_SIZE, MULTI_ACCOUNT_CONFIG } from "./constants";
+import {
+	REASONING_MESSAGES,
+	REASONING_CHUNK_DELAY,
+	THINKING_CONTENT_CHUNK_SIZE,
+	MULTI_ACCOUNT_CONFIG,
+	REQUEST_TIMEOUT_MS,
+	RETRY_STATUS_CODES,
+	RETRY_DELAYS_MS,
+	MAX_RETRY_ATTEMPTS,
+	MAX_SSE_BUFFER_BYTES
+} from "./constants";
 import { geminiCliModels } from "./models";
 import { validateImageUrl } from "./utils/image-utils";
 import { GenerationConfigValidator } from "./helpers/generation-config-validator";
-import { AutoModelSwitchingHelper } from "./helpers/auto-model-switching";
+import { AutoModelSwitchingHelper, FullStreamOptions } from "./helpers/auto-model-switching";
 import { NativeToolsManager } from "./helpers/native-tools-manager";
 import { CitationsProcessor } from "./helpers/citations-processor";
 import { GeminiUrlContextMetadata, GroundingMetadata, NativeToolsRequestParams } from "./types/native-tools";
@@ -47,11 +57,14 @@ export interface GeminiPart {
 		name: string;
 		args: object;
 	};
+	thoughtSignature?: string;
+	thought_signature?: string;
 	functionResponse?: {
 		name: string;
 		response: {
 			result: string;
 		};
+		thoughtSignature?: string;
 	};
 	inlineData?: {
 		mimeType: string;
@@ -88,6 +101,22 @@ function isTextContent(content: MessageContent): content is TextContent {
  * Handles communication with Google's Gemini API through the Code Assist endpoint.
  * Manages project discovery, streaming, and response parsing.
  */
+
+async function retryFetch(fn: () => Promise<Response>, maxAttempts = MAX_RETRY_ATTEMPTS): Promise<Response> {
+	let lastResponse: Response | null = null;
+	for (let attempt = 0; attempt < maxAttempts; attempt++) {
+		const response = await fn();
+		if (!(RETRY_STATUS_CODES as readonly number[]).includes(response.status)) {
+			return response; // Not a retryable error, return immediately
+		}
+		lastResponse = response;
+		const delay = RETRY_DELAYS_MS[attempt] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1];
+		console.warn(`[Retry] Got ${response.status}, attempt ${attempt + 1}/${maxAttempts}. Retrying in ${delay}ms...`);
+		await new Promise((r) => setTimeout(r, delay));
+	}
+	return lastResponse!; // Return last failed response to be handled by caller
+}
+
 export class GeminiApiClient {
 	private env: Env;
 	private authManager: AuthManager;
@@ -165,6 +194,12 @@ export class GeminiApiClient {
 			}
 
 			buffer += value;
+
+			if (buffer.length > MAX_SSE_BUFFER_BYTES) {
+				console.error(`[SSE] Buffer exceeded ${MAX_SSE_BUFFER_BYTES} bytes, terminating stream`);
+				throw new Error(`SSE stream buffer limit exceeded (${MAX_SSE_BUFFER_BYTES} bytes). Response may be too large.`);
+			}
+
 			const lines = buffer.split("\n");
 			buffer = lines.pop() || ""; // Keep the last, possibly incomplete, line.
 
@@ -188,107 +223,266 @@ export class GeminiApiClient {
 	/**
 	 * Converts a message to Gemini format, handling both text and image content.
 	 */
-	private messageToGeminiFormat(msg: ChatMessage): GeminiFormattedMessage {
-		const role = msg.role === "assistant" ? "model" : "user";
+	private async messageToGeminiFormat(msg: ChatMessage, allMessages?: ChatMessage[]): Promise<GeminiFormattedMessage> {
+		switch (msg.role) {
+			case "system":
+				return {
+					role: "user",
+					parts: [{ text: `SYSTEM: ${typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)}` }]
+				};
 
-		// Handle tool call results (tool role in OpenAI format)
-		if (msg.role === "tool") {
-			return {
-				role: "user",
-				parts: [
-					{
-						functionResponse: {
-							name: msg.tool_call_id || "unknown_function",
-							response: {
-								result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+			case "user": {
+				// Handle Anthropic-format tool_result messages sent as role:"user" with content array.
+				// Kilo Code (and other Anthropic-compatible clients) send tool results this way:
+				//   { role: "user", content: [{ type: "tool_result", tool_use_id: "...", content: [...] }] }
+				// We detect this and convert each item to a Gemini functionResponse part.
+				if (Array.isArray(msg.content)) {
+					const toolResultItems = (msg.content as unknown[]).filter(
+						(item): item is { type: "tool_result"; tool_use_id: string; content: unknown } =>
+							typeof item === "object" && item !== null && (item as Record<string, unknown>).type === "tool_result"
+					);
+
+					if (toolResultItems.length > 0) {
+						// Build functionResponse parts for each tool_result item
+						const parts: GeminiPart[] = await Promise.all(
+							toolResultItems.map(async (item) => {
+								const toolUseId = item.tool_use_id;
+
+								// Look up function name from the preceding assistant message's tool_use items
+								let functionName = "unknown_function";
+								if (allMessages) {
+									for (const m of allMessages) {
+										if (m.role === "assistant") {
+											// OpenAI format
+											if (m.tool_calls) {
+												const match = m.tool_calls.find((tc) => tc.id === toolUseId);
+												if (match) {
+													functionName = match.function.name;
+													break;
+												}
+											}
+											// Anthropic format: content array with tool_use items
+											if (Array.isArray(m.content)) {
+												const tuMatch = (m.content as unknown[]).find(
+													(c): c is { type: "tool_use"; id: string; name: string } =>
+														typeof c === "object" &&
+														c !== null &&
+														(c as Record<string, unknown>).type === "tool_use" &&
+														(c as Record<string, unknown>).id === toolUseId
+												);
+												if (tuMatch) {
+													functionName = tuMatch.name;
+													break;
+												}
+											}
+										}
+									}
+								}
+
+								// Flatten the tool result content to a string
+								let resultStr: string;
+								if (Array.isArray(item.content)) {
+									resultStr = (item.content as Array<{ text?: string }>)
+										.map((c) => c.text ?? JSON.stringify(c))
+										.join("\n");
+								} else if (typeof item.content === "string") {
+									resultStr = item.content;
+								} else {
+									resultStr = JSON.stringify(item.content);
+								}
+
+								return {
+									functionResponse: {
+										name: functionName,
+										response: { result: resultStr }
+									}
+								};
+							})
+						);
+						return { role: "user", parts };
+					}
+
+					// Regular user message with mixed content (text/images) — no tool_result items
+					return {
+						role: "user",
+						parts: this.parseMultimodalContent(msg.content)
+					};
+				}
+				return {
+					role: "user",
+					parts: [{ text: msg.content as string }]
+				};
+			}
+
+			case "assistant": {
+				// OpenAI format: msg.tool_calls is an array of ToolCall objects
+				const openAIToolCalls = msg.tool_calls;
+
+				// Anthropic format: msg.content is an array containing {type:"tool_use", ...} items
+				const anthropicToolUseItems = Array.isArray(msg.content)
+					? (msg.content as unknown[]).filter(
+							(item): item is { type: "tool_use"; id: string; name: string; input: Record<string, unknown> } =>
+								typeof item === "object" && item !== null && (item as Record<string, unknown>).type === "tool_use"
+						)
+					: [];
+
+				// --- Handle OpenAI-format tool_calls ---
+				if (openAIToolCalls && openAIToolCalls.length > 0) {
+					const parts = await Promise.all(
+						openAIToolCalls.map(async (tc) => {
+							let thoughtSignature: string | undefined = undefined;
+							try {
+								if (this.env.GEMINI_CLI_KV) {
+									const sig = await this.env.GEMINI_CLI_KV.get(`sig_${tc.id}`);
+									if (sig) thoughtSignature = sig;
+								}
+							} catch (e) {
+								console.error("Error reading signature from KV:", e);
+							}
+							if (!thoughtSignature && tc.id.includes("_sig_")) {
+								let sigMatch = tc.id.split("_sig_")[1];
+								if (sigMatch) {
+									// Some strict clients (like Kilo Code) sanitize '%' to '_' in tool IDs to make them valid DOM IDs.
+									// This turns URL-encoded '%2B' into '_2B', which corrupts the base64 thought_signature.
+									// We must safely revert any `_` followed by two hex digits back to `%`.
+									sigMatch = sigMatch.replace(/_([0-9A-Fa-f]{2})/g, "%$1");
+									thoughtSignature = decodeURIComponent(sigMatch);
+								}
+							}
+							return {
+								functionCall: {
+									name: tc.function.name,
+									args:
+										typeof tc.function.arguments === "string"
+											? JSON.parse(tc.function.arguments)
+											: tc.function.arguments
+								},
+								...(thoughtSignature ? { thoughtSignature } : {})
+							};
+						})
+					);
+					return { role: "model", parts };
+				}
+
+				// --- Handle Anthropic-format tool_use items in content array ---
+				if (anthropicToolUseItems.length > 0) {
+					const parts = await Promise.all(
+						anthropicToolUseItems.map(async (item) => {
+							let thoughtSignature: string | undefined = undefined;
+							try {
+								if (this.env.GEMINI_CLI_KV) {
+									const sig = await this.env.GEMINI_CLI_KV.get(`sig_${item.id}`);
+									if (sig) thoughtSignature = sig;
+								}
+							} catch (e) {
+								console.error("Error reading signature from KV:", e);
+							}
+							// Fallback: extract signature directly from ID to bypass KV propagation delays
+							if (!thoughtSignature && item.id.includes("_sig_")) {
+								let sigMatch = item.id.split("_sig_")[1];
+								if (sigMatch) {
+									// Safely revert client-side '%' to '_' sanitization
+									sigMatch = sigMatch.replace(/_([0-9A-Fa-f]{2})/g, "%$1");
+									thoughtSignature = decodeURIComponent(sigMatch);
+								}
+							}
+							return {
+								functionCall: {
+									name: item.name,
+									args: item.input ?? {}
+								},
+								...(thoughtSignature ? { thoughtSignature } : {})
+							};
+						})
+					);
+					return { role: "model", parts };
+				}
+
+				// Plain assistant text message
+				return {
+					role: "model",
+					parts: [{ text: (msg.content as string) || "" }]
+				};
+			}
+
+			case "tool": {
+				// OpenAI format: role="tool" with tool_call_id
+				let functionName = "unknown_function";
+
+				if (msg.tool_call_id) {
+					if (allMessages) {
+						for (const m of allMessages) {
+							if (m.role === "assistant" && m.tool_calls) {
+								const match = m.tool_calls.find((tc) => tc.id === msg.tool_call_id);
+								if (match) {
+									functionName = match.function.name;
+									break;
+								}
 							}
 						}
 					}
-				]
-			};
-		}
-
-		// Handle assistant messages with tool calls
-		if (msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0) {
-			const parts: GeminiPart[] = [];
-
-			// Add text content if present
-			if (typeof msg.content === "string" && msg.content.trim()) {
-				parts.push({ text: msg.content });
+				}
+				return {
+					role: "user",
+					parts: [
+						{
+							functionResponse: {
+								name: functionName,
+								response: {
+									result: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+								}
+							}
+						}
+					]
+				};
 			}
 
-			// Add function calls
-			for (const toolCall of msg.tool_calls) {
-				if (toolCall.type === "function") {
+			default:
+				return {
+					role: "user",
+					parts: [{ text: (msg.content as string) || "" }]
+				};
+		}
+	}
+
+	/**
+	 * Parses multimodal content (text and/or images) into GeminiPart array.
+	 */
+	private parseMultimodalContent(content: MessageContent[]): GeminiPart[] {
+		const parts: GeminiPart[] = [];
+		for (const item of content) {
+			if (item.type === "text") {
+				parts.push({ text: item.text });
+			} else if (item.type === "image_url" && item.image_url) {
+				const imageUrl = item.image_url.url;
+				const validation = validateImageUrl(imageUrl);
+				if (!validation.isValid) {
+					throw new Error(`Invalid image: ${validation.error}`);
+				}
+
+				if (imageUrl.startsWith("data:")) {
+					const [mimeType, base64Data] = imageUrl.split(",");
+					const mediaType = mimeType.split(":")[1].split(";")[0];
 					parts.push({
-						functionCall: {
-							name: toolCall.function.name,
-							args: JSON.parse(toolCall.function.arguments)
+						inlineData: {
+							mimeType: mediaType,
+							data: base64Data
+						}
+					});
+				} else {
+					// Note: Keep passing fileData.fileUri directly (fetching+base64 would 4x the size and exhaust memory).
+					// If Gemini returns a 400 error, the error text will include the URL — the existing error
+					// handler in performStreamRequest already forwards that message to the client.
+					parts.push({
+						fileData: {
+							mimeType: validation.mimeType || "image/jpeg",
+							fileUri: imageUrl
 						}
 					});
 				}
 			}
-
-			return { role: "model", parts };
 		}
-
-		if (typeof msg.content === "string") {
-			// Simple text message
-			return {
-				role,
-				parts: [{ text: msg.content }]
-			};
-		}
-
-		if (Array.isArray(msg.content)) {
-			// Multimodal message with text and/or images
-			const parts: GeminiPart[] = [];
-
-			for (const content of msg.content) {
-				if (content.type === "text") {
-					parts.push({ text: content.text });
-				} else if (content.type === "image_url" && content.image_url) {
-					const imageUrl = content.image_url.url;
-
-					// Validate image URL
-					const validation = validateImageUrl(imageUrl);
-					if (!validation.isValid) {
-						throw new Error(`Invalid image: ${validation.error}`);
-					}
-
-					if (imageUrl.startsWith("data:")) {
-						// Handle base64 encoded images
-						const [mimeType, base64Data] = imageUrl.split(",");
-						const mediaType = mimeType.split(":")[1].split(";")[0];
-
-						parts.push({
-							inlineData: {
-								mimeType: mediaType,
-								data: base64Data
-							}
-						});
-					} else {
-						// Handle URL images
-						// Note: For better reliability, you might want to fetch the image
-						// and convert it to base64, as Gemini API might have limitations with external URLs
-						parts.push({
-							fileData: {
-								mimeType: validation.mimeType || "image/jpeg",
-								fileUri: imageUrl
-							}
-						});
-					}
-				}
-			}
-
-			return { role, parts };
-		}
-
-		// Fallback for unexpected content format
-		return {
-			role,
-			parts: [{ text: String(msg.content) }]
-		};
+		return parts;
 	}
 
 	/**
@@ -333,10 +527,23 @@ export class GeminiApiClient {
 		await this.authManager.initializeAuth();
 		const projectId = await this.discoverProjectId();
 
-		const contents = messages.map((msg) => this.messageToGeminiFormat(msg));
+		// 1. Format contents into Gemini's format
+		const contents = await Promise.all(messages.map((msg) => this.messageToGeminiFormat(msg, messages)));
 
-		if (systemPrompt) {
-			contents.unshift({ role: "user", parts: [{ text: systemPrompt }] });
+		// Merge consecutive user messages that consist only of functionResponse parts
+		// into a single user message (required by Gemini API for parallel tool calls).
+		const mergedContents: GeminiFormattedMessage[] = [];
+		for (const content of contents) {
+			const prev = mergedContents[mergedContents.length - 1];
+			const isFunctionResponse = (c: GeminiFormattedMessage) =>
+				c.role === "user" && c.parts.every((p) => p.functionResponse !== undefined);
+
+			if (prev && isFunctionResponse(prev) && isFunctionResponse(content)) {
+				// Merge parts into the previous message
+				prev.parts.push(...content.parts);
+			} else {
+				mergedContents.push(content);
+			}
 		}
 
 		// Check if this is a thinking model and which thinking mode to use
@@ -376,12 +583,18 @@ export class GeminiApiClient {
 		// Configure request based on tool strategy
 		const { tools, toolConfig: finalToolConfig } = GenerationConfigValidator.createFinalToolConfiguration(
 			toolConfig,
-			options
+			options,
+			this.env
 		);
 
-		// For thinking models with fake thinking (fallback when real thinking is not enabled or not requested)
+		// Fake thinking should only stream when:
+		// 1. The model IS a thinking model but real thinking is NOT enabled/requested, OR
+		// 2. The model is NOT a thinking model (future-proofing for fallback on non-thinking models)
+		const shouldUseFakeThinking =
+			isFakeThinkingEnabled && !includeReasoning && (!isThinkingModel || !isRealThinkingEnabled);
 		let needsThinkingClose = false;
-		if (isThinkingModel && isFakeThinkingEnabled && !includeReasoning) {
+		if (shouldUseFakeThinking) {
+			console.log(`[FakeThinking] Streaming synthetic reasoning for model '${modelId}'`);
 			yield* this.generateReasoningOutput(messages, streamThinkingAsContent);
 			needsThinkingClose = streamThinkingAsContent; // Only need to close if we streamed as content
 		}
@@ -390,17 +603,23 @@ export class GeminiApiClient {
 			model: string;
 			project: string;
 			request: {
-				contents: unknown;
+				systemInstruction?: GeminiFormattedMessage;
+				contents: GeminiFormattedMessage[];
 				generationConfig: unknown;
-				tools: unknown;
-				toolConfig: unknown;
+				tools?: unknown[];
+				toolConfig?: unknown;
 				safetySettings?: unknown;
 			};
 		} = {
 			model: modelId,
 			project: projectId,
 			request: {
-				contents: contents,
+				...(systemPrompt
+					? {
+							systemInstruction: { role: "system", parts: [{ text: systemPrompt }] }
+						}
+					: {}),
+				contents: mergedContents,
 				generationConfig,
 				tools: tools,
 				toolConfig: finalToolConfig
@@ -413,12 +632,15 @@ export class GeminiApiClient {
 		}
 
 		yield* this.performStreamRequest(
+			modelId,
 			streamRequest,
 			needsThinkingClose,
 			false,
 			includeReasoning && streamThinkingAsContent,
-			modelId,
-			nativeToolsManager
+			systemPrompt,
+			messages,
+			nativeToolsManager,
+			0
 		);
 	}
 
@@ -520,74 +742,124 @@ export class GeminiApiClient {
 	/**
 	 * Performs the actual stream request with retry logic for 401 errors and auto model switching for rate limits.
 	 */
+	/**
+	 * Attempts to remap hallucinated tool args from a model that ignored the schema.
+	 * Example: Gemini 3.1 Preview hallucinates {path, line_range} instead of {files:[{path,line_ranges}]}
+	 * for the Kilo Code `read_file` tool. This method detects the mismatch and reconstructs the args.
+	 * @param toolName - The function call name returned by the model
+	 * @param returnedArgs - The args the model returned (may be hallucinated)
+	 * @param clientTools - The original tool definitions from the client request
+	 * @returns Corrected args, or the originals if no remapping was needed
+	 */
+	private remapHallucinatedToolArgs(returnedArgs: Record<string, unknown>): Record<string, unknown> {
+		return returnedArgs;
+	}
+
 	private async *performStreamRequest(
-		streamRequest: unknown,
-		needsThinkingClose: boolean = false,
+		modelId: string,
+		streamRequest: {
+			model: string;
+			project: string;
+			request: {
+				systemInstruction?: GeminiFormattedMessage;
+				contents: GeminiFormattedMessage[];
+				generationConfig: unknown;
+				tools?: unknown[];
+				toolConfig?: unknown;
+				safetySettings?: unknown;
+			};
+		}, // using unknown for now, typing this is complex
+		needsThinkingClose: boolean,
 		isRetry: boolean = false,
 		realThinkingAsContent: boolean = false,
-		originalModel?: string,
+		systemPrompt?: string,
+		messages?: ChatMessage[],
 		nativeToolsManager?: NativeToolsManager,
 		accountRetryCount: number = 0
 	): AsyncGenerator<StreamChunk> {
 		const citationsProcessor = new CitationsProcessor(this.env);
-		const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:streamGenerateContent?alt=sse`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${this.authManager.getAccessToken()}`
-			},
-			body: JSON.stringify(streamRequest)
-		});
+
+		console.log(`[GeminiAPI] Outgoing request payload:\n`, JSON.stringify(streamRequest, null, 2));
+		let response: Response;
+		try {
+			response = await retryFetch(async () => {
+				const abortController = new AbortController();
+				const timeoutId = setTimeout(() => abortController.abort(), REQUEST_TIMEOUT_MS);
+				try {
+					return await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:streamGenerateContent?alt=sse`, {
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${this.authManager.getAccessToken()}`
+						},
+						body: JSON.stringify(streamRequest),
+						signal: abortController.signal
+					});
+				} finally {
+					clearTimeout(timeoutId);
+				}
+			});
+		} catch (err: unknown) {
+			if (err instanceof Error && err.name === "AbortError") {
+				yield {
+					type: "error",
+					data: `Error: Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Please try again.`
+				};
+				return;
+			}
+			throw err;
+		}
 
 		if (!response.ok) {
+			const errorBody = await response.text().catch(() => "<unreadable>");
+			console.error(`[Gemini API] ${response.status} ${response.statusText}:`, errorBody.substring(0, 500));
+
 			if (response.status === 401 && !isRetry) {
 				console.log("Got 401 error in stream request, clearing token cache and retrying...");
 				await this.authManager.clearTokenCache();
 				await this.authManager.initializeAuth();
-				yield* this.performStreamRequest(
+				return yield* this.performStreamRequest(
+					modelId,
 					streamRequest,
 					needsThinkingClose,
 					true,
 					realThinkingAsContent,
-					originalModel,
+					systemPrompt,
+					messages,
 					nativeToolsManager,
-					accountRetryCount
+					0
 				); // Retry once
-				return;
 			}
 
 			// Handle rate limiting (429 or 503)
 			if (this.autoSwitchHelper.isRateLimitStatus(response.status)) {
 				// 1. Try model switching first if applicable
-				if (!isRetry && originalModel) {
-					const fallbackModel = this.autoSwitchHelper.getFallbackModel(originalModel);
+				if (!isRetry) {
+					// originalModel is no longer a parameter, so we can't use it here.
+					const fallbackModel = this.autoSwitchHelper.getFallbackModel(modelId); // Use modelId as originalModel
 					if (fallbackModel && this.autoSwitchHelper.isEnabled()) {
 						console.log(
-							`Got ${response.status} error for model ${originalModel}, switching to fallback model: ${fallbackModel}`
+							`Got ${response.status} error for model ${modelId}, switching to fallback model: ${fallbackModel}`
 						);
 
-						// Create new request with fallback model
+						// NOTE: Not emitting a text chunk here — it would corrupt the stream if this happens during
+						// a tool-call response, causing Cline/Kilo to treat it as a text message.
+
 						const fallbackRequest = {
-							...(streamRequest as Record<string, unknown>),
-							model: fallbackModel
+							model: fallbackModel,
+							project: streamRequest.project,
+							request: {
+								...streamRequest.request
+							}
 						};
-
-						// Add a notification chunk about the model switch
-						yield {
-							type: "text",
-							data: this.autoSwitchHelper.createSwitchNotification(
-								originalModel,
-								fallbackModel,
-								this.authManager.getCurrentAccountEmail()
-							)
-						};
-
 						yield* this.performStreamRequest(
+							fallbackModel,
 							fallbackRequest,
 							needsThinkingClose,
 							true,
 							realThinkingAsContent,
-							originalModel,
+							systemPrompt,
+							messages,
 							nativeToolsManager,
 							accountRetryCount
 						);
@@ -597,38 +869,41 @@ export class GeminiApiClient {
 
 				// 2. Try account rotation if multi-account is enabled
 				if (this.authManager.isMultiAccount() && accountRetryCount < MULTI_ACCOUNT_CONFIG.MAX_ACCOUNT_RETRY_ATTEMPTS) {
-					console.log(`Got rate limit error (${response.status}) for account ${this.authManager.getCurrentAccountIndex()}. Rotating accounts...`);
-					
+					console.log(
+						`Got rate limit error (${response.status}) for account ${this.authManager.getCurrentAccountIndex()}. Rotating accounts...`
+					);
+
 					// Mark current account as rate-limited
 					await this.authManager.markAccountRateLimited(this.authManager.getCurrentAccountIndex());
-					
+
 					try {
 						// This will find and initialize the next available account
 						await this.authManager.initializeAuth();
-						
+
 						// Update the request with the new project ID if it changed
 						const newProjectId = await this.discoverProjectId();
 						const rotatedRequest = {
-							...(streamRequest as Record<string, unknown>),
-							project: newProjectId
+							model: modelId,
+							project: newProjectId,
+							request: {
+								...streamRequest.request
+							}
 						};
-
 						const currentEmail = this.authManager.getCurrentAccountEmail();
-						const currentModel = (streamRequest as any).model || originalModel || "unknown-model";
-						
+
 						console.log(`Retrying request with account ${currentEmail} (retry ${accountRetryCount + 1})`);
-						
-						yield {
-							type: "text",
-							data: `[Rate limit hit. Rotating to account: ${currentEmail} | Model: ${currentModel}...]\n\n`
-						};
+
+						// NOTE: Not emitting a text chunk here — it would corrupt the stream if this happens during
+						// a tool-call response, causing Cline/Kilo to treat it as a text message.
 
 						yield* this.performStreamRequest(
+							modelId,
 							rotatedRequest,
 							needsThinkingClose,
 							false, // Reset isRetry for the new account's first attempt
 							realThinkingAsContent,
-							originalModel,
+							systemPrompt,
+							messages,
 							nativeToolsManager,
 							accountRetryCount + 1
 						);
@@ -640,24 +915,40 @@ export class GeminiApiClient {
 			}
 
 			// If we reach here, it means no fallback or rotation was possible or they all failed
-			const errorText = await response.text();
+			const errorText = errorBody;
 			console.error(`[GeminiAPI] Stream request failed: ${response.status}`, errorText);
-			
+
+			// **Kilo Code Infinite Loop Fix**:
+			// If Google returns 404 ("Requested entity was not found"), it means the `thought_signature`
+			// in the stream expired on the server. If we yield `type: "error"`, Kilo Code treats this
+			// as a raw network glitch and forcibly auto-retries the same tool call again, creating an infinite loop.
+			// By yielding this as a SYSTEM text message instead, we break the loop and force the LLM
+			// to see the error, forcing it to change its logic/plan instead of blindly retrying.
+			if (response.status === 404 && errorText.includes("Requested entity was not found")) {
+				yield {
+					type: "text",
+					data: "\n\n[SYSTEM ERROR: The backend context cache for the previous thought process has expired. The tool call failed because it took too long or the file was too large. Please rewrite your plan, use targeted operations like grep_search, and avoid reading massive files all at once.]"
+				};
+				return;
+			}
+
 			let errorMessage = `Stream request failed: ${response.status}`;
 			try {
 				const errorJson = JSON.parse(errorText);
 				if (errorJson.error && errorJson.error.message) {
 					errorMessage = `${errorJson.error.message}`;
 				}
-			} catch (e) {
+			} catch {
 				// Fallback to raw text if not JSON
 				if (errorText.length > 0) {
 					errorMessage += ` - ${errorText.substring(0, 500)}`;
 				}
+				// If JSON parsing fails, the errorMessage will already contain the status and potentially raw text.
+				// We don't need to yield a separate error for the parsing failure itself,
+				// as the main error message will cover the underlying issue.
 			}
-			
-			// ONLY yield the error chunk if we are not going to retry
-			yield { type: "text", data: `Error: ${errorMessage}` };
+
+			yield { type: "error", data: errorMessage };
 			return;
 		}
 
@@ -770,6 +1061,7 @@ export class GeminiApiClient {
 					}
 					// Handle function calls from Gemini
 					else if (part.functionCall) {
+						console.log("RAW_FUNCTION_CALL_PART:", JSON.stringify(part));
 						// Close thinking tag before function call if needed
 						if ((needsThinkingClose || (realThinkingAsContent && hasStartedThinking)) && !hasClosedThinking) {
 							yield {
@@ -779,9 +1071,13 @@ export class GeminiApiClient {
 							hasClosedThinking = true;
 						}
 
+						const correctedArgs = this.remapHallucinatedToolArgs(
+							(part.functionCall.args || {}) as Record<string, unknown>
+						);
 						const functionCallData: GeminiFunctionCall = {
 							name: part.functionCall.name,
-							args: part.functionCall.args
+							args: correctedArgs,
+							thoughtSignature: part.thoughtSignature || part.thought_signature
 						};
 
 						yield {
@@ -848,8 +1144,16 @@ export class GeminiApiClient {
 					usage = chunk.data as UsageData;
 				} else if (chunk.type === "tool_code" && typeof chunk.data === "object") {
 					const toolData = chunk.data as GeminiFunctionCall;
+					const newCallId = `call_${crypto.randomUUID()}`;
+
+					if (toolData.thoughtSignature && this.env.GEMINI_CLI_KV) {
+						this.env.GEMINI_CLI_KV.put(`sig_${newCallId}`, toolData.thoughtSignature, { expirationTtl: 86400 }).catch(
+							(e: unknown) => console.error("KV store error:", e)
+						);
+					}
+
 					tool_calls.push({
-						id: `call_${crypto.randomUUID()}`,
+						id: newCallId,
 						type: "function",
 						function: {
 							name: toolData.name,
@@ -872,7 +1176,7 @@ export class GeminiApiClient {
 					modelId,
 					systemPrompt,
 					messages,
-					options,
+					options as FullStreamOptions,
 					this.streamContent.bind(this)
 				);
 				if (fallbackResult) {

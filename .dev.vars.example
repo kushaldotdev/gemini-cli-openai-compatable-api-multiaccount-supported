@@ -25,7 +25,7 @@ ENABLE_MULTI_ACCOUNT=true
 # Optional: Enable fake thinking output for thinking models (set to "true" to enable)
 # When enabled, models marked with thinking: true will generate synthetic reasoning text
 # before providing their actual response, similar to OpenAI's o3 model behavior
-ENABLE_FAKE_THINKING=true
+ENABLE_FAKE_THINKING=false
 
 # Optional: Enable real Gemini thinking output (set to "true" to enable)
 # When enabled, requests with include_reasoning=true will use Gemini's native thinking
@@ -39,6 +39,15 @@ STREAM_THINKING_AS_CONTENT=true
 
 # Optional: Auto switch from Pro to flash when you are getting rate-limited
 ENABLE_AUTO_MODEL_SWITCHING=true
+
+# Optional: Disable native function calling and enforce strict OpenAI format natively
+# FORCE_OPENAI_TOOL_FORMAT=true
+
+# Optional: Implement an inbound rate limiter with requests per minute
+# RATE_LIMIT_REQUESTS_PER_MINUTE=60
+
+# Optional: Restrict allowed CORS Origins. Use a comma-separated list of fully qualified domains.
+# ALLOWED_ORIGINS=http://localhost:3000,https://my-frontend.com
 
 # Optional: Gemini Moderation Settings
 # Configure content safety thresholds. Valid values: BLOCK_NONE, BLOCK_FEW, BLOCK_SOME, BLOCK_ONLY_HIGH, HARM_BLOCK_THRESHOLD_UNSPECIFIED

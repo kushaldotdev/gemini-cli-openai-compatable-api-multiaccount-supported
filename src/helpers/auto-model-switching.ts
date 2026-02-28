@@ -1,5 +1,21 @@
 import { AUTO_SWITCH_MODEL_MAP, RATE_LIMIT_STATUS_CODES } from "../constants";
-import { Env, ChatMessage, UsageData, StreamChunk } from "../types";
+import { Env, ChatMessage, UsageData, StreamChunk, Tool, ToolChoice } from "../types";
+import { NativeToolsRequestParams } from "../types/native-tools";
+
+export type FullStreamOptions = {
+	includeReasoning?: boolean;
+	thinkingBudget?: number;
+	tools?: Tool[];
+	tool_choice?: ToolChoice;
+	max_tokens?: number;
+	temperature?: number;
+	top_p?: number;
+	stop?: string | string[];
+	presence_penalty?: number;
+	frequency_penalty?: number;
+	seed?: number;
+	response_format?: { type: "text" | "json_object" };
+} & NativeToolsRequestParams;
 
 /**
  * Helper class for handling automatic model switching on rate limit errors.
@@ -67,20 +83,12 @@ export class AutoModelSwitchingHelper {
 		originalModel: string,
 		systemPrompt: string,
 		messages: ChatMessage[],
-		options:
-			| {
-					includeReasoning?: boolean;
-					thinkingBudget?: number;
-			  }
-			| undefined,
+		options: FullStreamOptions | undefined,
 		streamContentFn: (
 			modelId: string,
 			systemPrompt: string,
 			messages: ChatMessage[],
-			options?: {
-				includeReasoning?: boolean;
-				thinkingBudget?: number;
-			}
+			options?: FullStreamOptions
 		) => AsyncGenerator<StreamChunk>
 	): Promise<{ content: string; usage?: UsageData } | null> {
 		const fallbackModel = this.getFallbackModel(originalModel);

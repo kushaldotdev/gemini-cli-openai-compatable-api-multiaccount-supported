@@ -4,6 +4,7 @@ import { OpenAIRoute } from "./routes/openai";
 import { DebugRoute } from "./routes/debug";
 import { openAIApiKeyAuth } from "./middlewares/auth";
 import { loggingMiddleware } from "./middlewares/logging";
+import { rateLimiterMiddleware } from "./middlewares/rate-limiter";
 
 /**
  * Gemini CLI OpenAI Worker
@@ -25,10 +26,40 @@ const app = new Hono<{ Bindings: Env }>();
 // Add logging middleware
 app.use("*", loggingMiddleware);
 
+// Startup Config Validation Middleware
+let isStartupValidated = false;
+app.use("*", async (c, next) => {
+	if (isStartupValidated) return next();
+
+	if (!c.env.GEMINI_CLI_KV) {
+		return c.json({ error: "Worker Configuration Error: GEMINI_CLI_KV namespace is not bound to the worker." }, 503);
+	}
+	if (!c.env.GCP_SERVICE_ACCOUNT) {
+		return c.json({ error: "Worker Configuration Error: GCP_SERVICE_ACCOUNT environment variable is missing." }, 503);
+	}
+	try {
+		JSON.parse(c.env.GCP_SERVICE_ACCOUNT);
+	} catch {
+		return c.json({ error: "Worker Configuration Error: GCP_SERVICE_ACCOUNT must be valid JSON." }, 503);
+	}
+
+	isStartupValidated = true;
+	await next();
+});
+
 // Add CORS headers for all requests
 app.use("*", async (c, next) => {
+	const requestOrigin = c.req.header("Origin") || "";
+	const allowedOriginsStr = c.env.ALLOWED_ORIGINS || "";
+	let allowOrigin = "*";
+
+	if (allowedOriginsStr) {
+		const allowed = allowedOriginsStr.split(",").map((o: string) => o.trim());
+		allowOrigin = allowed.includes(requestOrigin) ? requestOrigin : allowed[0];
+	}
+
 	// Set CORS headers
-	c.header("Access-Control-Allow-Origin", "*");
+	c.header("Access-Control-Allow-Origin", allowOrigin);
 	c.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 	c.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
@@ -43,6 +74,8 @@ app.use("*", async (c, next) => {
 
 // Apply OpenAI API key authentication middleware to all /v1 routes
 app.use("/v1/*", openAIApiKeyAuth);
+
+app.use("/v1/chat/completions", rateLimiterMiddleware);
 
 // Setup route handlers
 app.route("/v1", OpenAIRoute);

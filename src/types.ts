@@ -1,4 +1,4 @@
-import { NativeToolResponse } from "./types/native-tools";
+import { GroundingMetadata, NativeToolResponse } from "./types/native-tools";
 
 // --- Safety Threshold Types ---
 export type SafetyThreshold =
@@ -19,6 +19,9 @@ export interface Env {
 	STREAM_THINKING_AS_CONTENT?: string; // Optional flag to stream thinking as content with <thinking> tags (set to "true" to enable)
 	ENABLE_AUTO_MODEL_SWITCHING?: string; // Optional flag to enable automatic fallback from pro to flash on 429 errors (set to "true" to enable)
 	ENABLE_MULTI_ACCOUNT?: string; // Optional flag to enable multi-account rotation for rate limit avoidance (set to "true" to enable)
+	FORCE_OPENAI_TOOL_FORMAT?: string; // When "true", disables Gemini native function calling mode
+	RATE_LIMIT_REQUESTS_PER_MINUTE?: string; // Optional flag to limit incoming requests per minute
+	ALLOWED_ORIGINS?: string; // Optional comma-separated list of allowed CORS origins
 	GEMINI_MODERATION_HARASSMENT_THRESHOLD?: SafetyThreshold;
 	GEMINI_MODERATION_HATE_SPEECH_THRESHOLD?: SafetyThreshold;
 	GEMINI_MODERATION_SEXUALLY_EXPLICIT_THRESHOLD?: SafetyThreshold;
@@ -58,7 +61,10 @@ export interface ModelInfo {
 	inputPrice: number;
 	outputPrice: number;
 	description: string;
-	thinking: boolean; // Indicates if the model supports thinking
+	thinking?: boolean; // Indicates if the model supports thinking
+	supportsSearch?: boolean;
+	deprecated?: boolean;
+	deprecatedMessage?: string;
 }
 
 // --- Chat Completion Request Interface ---
@@ -173,6 +179,7 @@ export interface ChatCompletionUsage {
 export interface GeminiFunctionCall {
 	name: string;
 	args: object;
+	thoughtSignature?: string;
 }
 
 // --- Usage and Reasoning Data Types ---
@@ -196,6 +203,7 @@ export interface StreamChunk {
 		| "real_thinking"
 		| "tool_code"
 		| "native_tool"
-		| "grounding_metadata";
-	data: string | UsageData | ReasoningData | GeminiFunctionCall | NativeToolResponse;
+		| "grounding_metadata"
+		| "error";
+	data: string | UsageData | ReasoningData | GeminiFunctionCall | NativeToolResponse | GroundingMetadata;
 }

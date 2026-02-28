@@ -15,9 +15,23 @@ export const REASONING_MESSAGES = [
 export const REASONING_CHUNK_DELAY = 100;
 
 // Default chunk size for streaming thinking content (in characters)
-// This controls how many characters are sent per chunk when streaming thinking content
-// Smaller values create smoother streaming but more network requests
-export const THINKING_CONTENT_CHUNK_SIZE = 15;
+/**
+ * Controls chunk size when streaming FAKE thinking content (ENABLE_FAKE_THINKING=true).
+ * Larger values = fewer SSE events = less overhead. The per-chunk setTimeout(50ms) delays
+ * in generateReasoningOutput() are INTENTIONAL — they create realistic progressive streaming.
+ * With chunk size 100: ~20 chunks × 50ms = ~1s total fake thinking stream time.
+ */
+export const THINKING_CONTENT_CHUNK_SIZE = 100;
+
+export const REQUEST_TIMEOUT_MS = 120_000; // 2 minutes
+export const TOKEN_REFRESH_TIMEOUT_MS = 30_000; // 30 seconds
+
+export const RETRY_STATUS_CODES = [500, 502, 504] as const;
+export const RETRY_DELAYS_MS = [1000, 3000, 8000] as const; // exponential backoff
+export const MAX_RETRY_ATTEMPTS = 3;
+
+export const MAX_SSE_BUFFER_BYTES = 10_485_760; // 10 MB
+export const RATE_LIMIT_COOLDOWNS_MS = [60_000, 300_000, 900_000]; // 1min, 5min, 15min
 
 // Thinking budget constants
 export const DEFAULT_THINKING_BUDGET = -1; // -1 means dynamic allocation by Gemini (recommended)

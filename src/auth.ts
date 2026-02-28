@@ -10,7 +10,7 @@ import {
 	KV_ACCOUNT_ROTATION_KEY,
 	KV_ACCOUNT_HEALTH_PREFIX
 } from "./config";
-import { MULTI_ACCOUNT_CONFIG } from "./constants";
+import { MULTI_ACCOUNT_CONFIG, RATE_LIMIT_COOLDOWNS_MS, TOKEN_REFRESH_TIMEOUT_MS } from "./constants";
 
 // Auth-related interfaces
 interface TokenRefreshResponse {
@@ -45,6 +45,7 @@ interface AccountHealthStatus {
 	is_rate_limited: boolean;
 	rate_limited_at?: number;
 	last_success?: number;
+	consecutive_rate_limits?: number;
 }
 
 /**
@@ -58,8 +59,9 @@ export class AuthManager {
 	private accounts: OAuth2Credentials[] = [];
 	private currentAccountIndex: number = 0;
 	private isMultiAccountMode: boolean = false;
-	private accountIds: string[] = []; // Stable IDs for each account
+	private accountIds: string[] = [];
 	private accountEmails: string[] = []; // Extracted emails for each account
+	private _initialized: boolean = false;
 
 	constructor(env: Env) {
 		this.env = env;
@@ -72,17 +74,17 @@ export class AuthManager {
 	private getEmailFromToken(token: string | undefined): string {
 		if (!token) return "unknown-account";
 		try {
-			const parts = token.split('.');
+			const parts = token.split(".");
 			if (parts.length >= 2) {
 				// Base64URL to Base64
-				let base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+				let base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
 				// Add padding
-				while (base64.length % 4) base64 += '=';
-				
+				while (base64.length % 4) base64 += "=";
+
 				const payload = JSON.parse(atob(base64));
 				return payload.email || payload.unique_name || payload.sub || "unknown-account";
 			}
-		} catch (e) {
+		} catch {
 			// Fallback if not a JWT or decoding fails
 		}
 		return "unknown-account";
@@ -95,7 +97,10 @@ export class AuthManager {
 		const msgUint8 = new TextEncoder().encode(account.refresh_token);
 		const hashBuffer = await crypto.subtle.digest("SHA-256", msgUint8);
 		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("").substring(0, 16);
+		return hashArray
+			.map((b) => b.toString(16).padStart(2, "0"))
+			.join("")
+			.substring(0, 16);
 	}
 
 	/**
@@ -139,14 +144,14 @@ export class AuthManager {
 				}
 				this.accounts.push(account);
 				this.accountIds.push(await this.getAccountId(account));
-				
-				// Priority for identification: 
+
+				// Priority for identification:
 				// 1. Manual email field
 				// 2. id_token JWT
 				// 3. refresh_token JWT
 				// 4. project_id
-				let id = (account as any).email || "unknown-account";
-				
+				let id = ((account as unknown as Record<string, unknown>).email as string) || "unknown-account";
+
 				if (id === "unknown-account") {
 					id = this.getEmailFromToken(account.id_token);
 				}
@@ -159,7 +164,7 @@ export class AuthManager {
 				if (id === "unknown-account") {
 					id = `account:${i}`;
 				}
-				
+
 				this.accountEmails.push(id);
 			}
 
@@ -232,12 +237,16 @@ export class AuthManager {
 	/**
 	 * Updates the health status for a specific account.
 	 */
-	private async updateAccountHealth(accountIndex: number, health: AccountHealthStatus): Promise<void> {
+	private async updateAccountHealth(
+		accountIndex: number,
+		health: AccountHealthStatus,
+		cooldownMs?: number
+	): Promise<void> {
 		try {
 			const accountId = this.accountIds[accountIndex];
 			// Store with TTL for auto-expiry of rate limit status
 			await this.env.GEMINI_CLI_KV.put(`${KV_ACCOUNT_HEALTH_PREFIX}${accountId}`, JSON.stringify(health), {
-				expirationTtl: Math.floor(MULTI_ACCOUNT_CONFIG.RATE_LIMIT_COOLDOWN_MS / 1000) + 60 // Add buffer
+				expirationTtl: Math.floor((cooldownMs ?? MULTI_ACCOUNT_CONFIG.RATE_LIMIT_COOLDOWN_MS) / 1000) + 60 // Add buffer
 			});
 		} catch (error) {
 			console.error(`Failed to update health for account at index ${accountIndex}:`, error);
@@ -245,24 +254,56 @@ export class AuthManager {
 	}
 
 	/**
-	 * Marks an account as rate-limited.
+	 * Marks an account as rate limited in KV storage with progressive cooldown.
 	 */
 	public async markAccountRateLimited(accountIndex: number): Promise<void> {
-		console.log(`Marking account ${accountIndex} as rate-limited`);
-		await this.updateAccountHealth(accountIndex, {
-			is_rate_limited: true,
-			rate_limited_at: Date.now()
-		});
+		if (!this.isMultiAccountMode) return;
+
+		try {
+			const existing = await this.getAccountHealth(accountIndex);
+			const consecutive = (existing.consecutive_rate_limits ?? 0) + 1;
+			const cooldowns = RATE_LIMIT_COOLDOWNS_MS;
+			const cooldownMs = cooldowns[Math.min(consecutive - 1, cooldowns.length - 1)];
+
+			console.log(
+				`Marking account ${accountIndex} (${this.accountEmails[accountIndex]}) as rate limited (consecutive: ${consecutive}, cooldown: ${cooldownMs}ms)`
+			);
+
+			await this.updateAccountHealth(
+				accountIndex,
+				{
+					is_rate_limited: true,
+					rate_limited_at: Date.now(),
+					consecutive_rate_limits: consecutive
+				},
+				cooldownMs
+			);
+		} catch (error) {
+			console.error(`Error marking account ${accountIndex} as rate limited:`, error);
+		}
 	}
 
 	/**
-	 * Marks an account as healthy (successful request).
+	 * Marks an account as healthy (not rate limited) in KV storage.
 	 */
-	private async markAccountHealthy(accountIndex: number): Promise<void> {
-		await this.updateAccountHealth(accountIndex, {
-			is_rate_limited: false,
-			last_success: Date.now()
-		});
+	public async markAccountHealthy(accountIndex: number): Promise<void> {
+		if (!this.isMultiAccountMode) return;
+
+		try {
+			// Only call this when transitioning from rate-limited to healthy
+			const health = await this.getAccountHealth(accountIndex);
+			if (health.is_rate_limited) {
+				console.log(`Marking account ${accountIndex} (${this.accountEmails[accountIndex]}) as healthy again`);
+				await this.updateAccountHealth(accountIndex, {
+					is_rate_limited: false,
+					last_success: Date.now(),
+					consecutive_rate_limits: 0 // Reset counter on recovery
+				});
+			}
+			// If not rate-limited, do nothing — avoid unnecessary KV writes
+		} catch (error) {
+			console.error(`Error marking account ${accountIndex} as healthy:`, error);
+		}
 	}
 
 	/**
@@ -349,6 +390,9 @@ export class AuthManager {
 	 * Supports multi-account rotation for rate limit avoidance.
 	 */
 	public async initializeAuth(): Promise<void> {
+		if (this._initialized && this.accessToken) {
+			return; // Already initialized in this request lifecycle, skip
+		}
 		// Load accounts on first call
 		if (this.accounts.length === 0) {
 			await this.loadAccounts();
@@ -427,6 +471,8 @@ export class AuthManager {
 
 			throw new Error("Authentication failed: " + errorMessage);
 		}
+		// Mark as initialized only after successful auth
+		this._initialized = true;
 	}
 
 	/**
@@ -435,18 +481,26 @@ export class AuthManager {
 	private async refreshAndCacheToken(refreshToken: string, accountIndex: number): Promise<void> {
 		console.log(`Refreshing OAuth token for account ${accountIndex}...`);
 
-		const refreshResponse = await fetch(OAUTH_REFRESH_URL, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/x-www-form-urlencoded"
-			},
-			body: new URLSearchParams({
-				client_id: OAUTH_CLIENT_ID,
-				client_secret: OAUTH_CLIENT_SECRET,
-				refresh_token: refreshToken,
-				grant_type: "refresh_token"
-			})
-		});
+		const ctrl = new AbortController();
+		const tid = setTimeout(() => ctrl.abort(), TOKEN_REFRESH_TIMEOUT_MS);
+		let refreshResponse: Response;
+		try {
+			refreshResponse = await fetch(OAUTH_REFRESH_URL, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/x-www-form-urlencoded"
+				},
+				body: new URLSearchParams({
+					client_id: OAUTH_CLIENT_ID,
+					client_secret: OAUTH_CLIENT_SECRET,
+					refresh_token: refreshToken,
+					grant_type: "refresh_token"
+				}),
+				signal: ctrl.signal
+			});
+		} finally {
+			clearTimeout(tid);
+		}
 
 		if (!refreshResponse.ok) {
 			const errorText = await refreshResponse.text();
@@ -489,7 +543,9 @@ export class AuthManager {
 				await this.env.GEMINI_CLI_KV.put(cacheKey, JSON.stringify(tokenData), {
 					expirationTtl: ttlSeconds
 				});
-				console.log(`Token cached in KV storage for account ${accountIndex} (${accountId}) with TTL of ${ttlSeconds} seconds`);
+				console.log(
+					`Token cached in KV storage for account ${accountIndex} (${accountId}) with TTL of ${ttlSeconds} seconds`
+				);
 			} else {
 				console.log("Token expires too soon, not caching in KV");
 			}
@@ -524,7 +580,7 @@ export class AuthManager {
 			// In multi-account mode, we look for the current account's token
 			const accountId = this.accountIds[this.currentAccountIndex];
 			const cacheKey = accountId ? `${KV_TOKEN_KEY}_${accountId}` : KV_TOKEN_KEY;
-			
+
 			const cachedToken = await this.env.GEMINI_CLI_KV.get(cacheKey, "json");
 			if (cachedToken) {
 				const tokenData = cachedToken as CachedTokenData;
@@ -558,14 +614,22 @@ export class AuthManager {
 	): Promise<unknown> {
 		await this.initializeAuth();
 
-		const response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:${method}`, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				Authorization: `Bearer ${this.accessToken}`
-			},
-			body: JSON.stringify(body)
-		});
+		const ctrl = new AbortController();
+		const tid = setTimeout(() => ctrl.abort(), TOKEN_REFRESH_TIMEOUT_MS);
+		let response: Response;
+		try {
+			response = await fetch(`${CODE_ASSIST_ENDPOINT}/${CODE_ASSIST_API_VERSION}:${method}`, {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: `Bearer ${this.accessToken}`
+				},
+				body: JSON.stringify(body),
+				signal: ctrl.signal
+			});
+		} finally {
+			clearTimeout(tid);
+		}
 
 		if (!response.ok) {
 			// Handle 401 authentication errors
@@ -605,12 +669,9 @@ export class AuthManager {
 			throw new Error(`API call failed with status ${response.status}: ${errorText}`);
 		}
 
-		// Mark account as healthy on successful request
-		if (this.isMultiAccountMode) {
-			await this.markAccountHealthy(this.currentAccountIndex);
-		}
-
-		return response.json();
+		// Process successful response
+		const data = await response.json();
+		return data;
 	}
 
 	/**
