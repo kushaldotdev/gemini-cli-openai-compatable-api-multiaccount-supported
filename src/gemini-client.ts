@@ -333,7 +333,8 @@ export class GeminiApiClient {
 							let thoughtSignature: string | undefined = undefined;
 							try {
 								if (this.env.GEMINI_CLI_KV) {
-									const sig = await this.env.GEMINI_CLI_KV.get(`sig_${tc.id}`);
+									const baseId = tc.id.split("_sig_")[0];
+									const sig = await this.env.GEMINI_CLI_KV.get(`sig_${baseId}`);
 									if (sig) thoughtSignature = sig;
 								}
 							} catch (e) {
@@ -346,7 +347,12 @@ export class GeminiApiClient {
 									// This turns URL-encoded '%2B' into '_2B', which corrupts the base64 thought_signature.
 									// We must safely revert any `_` followed by two hex digits back to `%`.
 									sigMatch = sigMatch.replace(/_([0-9A-Fa-f]{2})/g, "%$1");
-									thoughtSignature = decodeURIComponent(sigMatch);
+									try {
+										thoughtSignature = decodeURIComponent(sigMatch);
+									} catch {
+										// ID suffix is not valid URL encoding (e.g. expired/mangled). Skip signature.
+										console.warn("[GeminiAPI] Could not decode thought signature from tool call ID (malformed URI). Proceeding without signature.");
+									}
 								}
 							}
 							return {
@@ -371,7 +377,8 @@ export class GeminiApiClient {
 							let thoughtSignature: string | undefined = undefined;
 							try {
 								if (this.env.GEMINI_CLI_KV) {
-									const sig = await this.env.GEMINI_CLI_KV.get(`sig_${item.id}`);
+									const baseId = item.id.split("_sig_")[0];
+									const sig = await this.env.GEMINI_CLI_KV.get(`sig_${baseId}`);
 									if (sig) thoughtSignature = sig;
 								}
 							} catch (e) {
@@ -383,7 +390,12 @@ export class GeminiApiClient {
 								if (sigMatch) {
 									// Safely revert client-side '%' to '_' sanitization
 									sigMatch = sigMatch.replace(/_([0-9A-Fa-f]{2})/g, "%$1");
-									thoughtSignature = decodeURIComponent(sigMatch);
+									try {
+										thoughtSignature = decodeURIComponent(sigMatch);
+									} catch {
+										// ID suffix is not valid URL encoding. Skip signature.
+										console.warn("[GeminiAPI] Could not decode thought signature from tool call ID (malformed URI). Proceeding without signature.");
+									}
 								}
 							}
 							return {
@@ -740,6 +752,59 @@ export class GeminiApiClient {
 	}
 
 	/**
+	 * Strips thought signatures, thought parts, and converts tool call history to plain text
+	 * for a stateless recovery request. This removes all session-tied state that Google would
+	 * reject with 404 when the backend cache has expired.
+	 */
+	private stripThoughtSignatures(contents: GeminiFormattedMessage[]): GeminiFormattedMessage[] {
+		// Deep clone to avoid mutating the original message array
+		const stripped = JSON.parse(JSON.stringify(contents)) as GeminiFormattedMessage[];
+		const result: GeminiFormattedMessage[] = [];
+
+		for (const message of stripped) {
+			if (!message.parts) {
+				result.push(message);
+				continue;
+			}
+
+			// Remove actual thought (thinking) parts — Gemini rejects them when thinkingConfig is absent
+			message.parts = message.parts.filter(part => part.thought !== true);
+
+			// Convert functionCall and functionResponse parts to plain text to eliminate all
+			// orphaned session references that Google's backend would reject with 404.
+			const convertedParts: GeminiPart[] = [];
+			for (const part of message.parts) {
+				if (part.functionCall) {
+					const name = (part.functionCall as any).name ?? 'unknown';
+					const args = JSON.stringify((part.functionCall as any).args ?? {});
+					convertedParts.push({ text: `[Tool call: ${name}(${args})]` });
+				} else if (part.functionResponse) {
+					const name = (part.functionResponse as any).name ?? 'unknown';
+					const response = JSON.stringify((part.functionResponse as any).response ?? {});
+					convertedParts.push({ text: `[Tool result: ${name} → ${response}]` });
+				} else {
+					if ('thoughtSignature' in part) delete part.thoughtSignature;
+					if ('thought_signature' in part) delete part.thought_signature;
+					convertedParts.push(part);
+				}
+			}
+			message.parts = convertedParts;
+
+			// After conversion, if parts are empty (was a thinking-only model turn), add placeholder
+			if (message.parts.length === 0) {
+				if (message.role === 'model') {
+					message.parts = [{ text: '...' }];
+				} else {
+					continue; // Drop empty user turns
+				}
+			}
+
+			result.push(message);
+		}
+		return result;
+	}
+
+	/**
 	 * Performs the actual stream request with retry logic for 401 errors and auto model switching for rate limits.
 	 */
 	/**
@@ -775,7 +840,8 @@ export class GeminiApiClient {
 		systemPrompt?: string,
 		messages?: ChatMessage[],
 		nativeToolsManager?: NativeToolsManager,
-		accountRetryCount: number = 0
+		accountRetryCount: number = 0,
+		isStatelessRecovery: boolean = false
 	): AsyncGenerator<StreamChunk> {
 		const citationsProcessor = new CitationsProcessor(this.env);
 
@@ -918,16 +984,52 @@ export class GeminiApiClient {
 			const errorText = errorBody;
 			console.error(`[GeminiAPI] Stream request failed: ${response.status}`, errorText);
 
-			// **Kilo Code Infinite Loop Fix**:
+			// **Google Cache Expiration Recovery**:
 			// If Google returns 404 ("Requested entity was not found"), it means the `thought_signature`
-			// in the stream expired on the server. If we yield `type: "error"`, Kilo Code treats this
-			// as a raw network glitch and forcibly auto-retries the same tool call again, creating an infinite loop.
-			// By yielding this as a SYSTEM text message instead, we break the loop and force the LLM
-			// to see the error, forcing it to change its logic/plan instead of blindly retrying.
+			// in the stream expired on their server. We cannot resume the thought process at all.
+			// However, we CAN drop the request down to a stateless (non-thinking) query by stripping the signatures
+			// and removing the thinkingConfig. This bypasses the 404 and allows the conversation to seamlessly continue.
 			if (response.status === 404 && errorText.includes("Requested entity was not found")) {
+				if (!isStatelessRecovery) {
+					console.warn("[GeminiAPI] 404 Cache Expired! Automatically falling back to a stateless recovery request (thinking temporarily disabled for this turn).");
+					
+					// Deep clone the generation config
+					const newGenerationConfig = JSON.parse(JSON.stringify(streamRequest.request.generationConfig || {})) as Record<string, unknown>;
+					
+					// Delete thinkingConfig completely to prevent Google from checking signatures or cached states
+					delete newGenerationConfig.thinkingConfig;
+
+						// Use the ORIGINAL modelId (not the auto-switched model) for recovery.
+					// Also re-discover the project ID to get a completely clean slate.
+					const recoveryProjectId = await this.discoverProjectId().catch(() => streamRequest.project);
+					const newRequest = {
+						model: modelId, // Reset to original model - avoids inheriting the broken auto-switched model
+						project: recoveryProjectId,
+						request: {
+							...streamRequest.request,
+							generationConfig: newGenerationConfig,
+							contents: this.stripThoughtSignatures(streamRequest.request.contents)
+						}
+					};
+
+					return yield* this.performStreamRequest(
+						modelId, // Original model
+						newRequest,
+						needsThinkingClose,
+						false, // Reset isRetry so it can auto-switch again if needed
+						false, // Disable thinking stream wrapper (stateless response)
+						systemPrompt,
+						messages,
+						nativeToolsManager,
+						0, // Reset accountRetryCount for the recovery
+						true // isStatelessRecovery = true
+					);
+				}
+
+				// If the stateless recovery STILL 404s, break the loop and force LLM to see the error
 				yield {
 					type: "text",
-					data: "\n\n[SYSTEM ERROR: The backend context cache for the previous thought process has expired. The tool call failed because it took too long or the file was too large. Please rewrite your plan, use targeted operations like grep_search, and avoid reading massive files all at once.]"
+					data: "\n\n[SYSTEM ERROR: The backend context cache for the previous thought process has expired. The stateless recovery request also failed. Please rewrite your plan, use targeted operations like grep_search, and avoid reading massive files all at once.]"
 				};
 				return;
 			}
